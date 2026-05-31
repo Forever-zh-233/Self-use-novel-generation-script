@@ -1445,6 +1445,133 @@ SIGNATURE_PATTERNS = [
 ]
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 三线节奏(Strand Weave)。机制思路抄自竞品,按本书玄幻长生内核重定义为
+# 道途/情义/天地三线。阈值全在 config/strand_weave.json,代码不写死配比。
+# 关键:"本章主导哪条线"由 archivist(LLM)打 dominant_strand 标签,代码只
+# 维护计数器、比配比、报断档——零文风/剧情硬编码,符合反 gaming 原则。
+# ──────────────────────────────────────────────────────────────────────
+def load_strand_config() -> Dict[str, Any]:
+    return load_json(CONFIG_DIR / "strand_weave.json", {}) or {}
+
+
+def normalize_strand(label: Any) -> str:
+    """把 archivist 给的标签(可能用别名)归一到三条正式线名之一。无法归类返回 ''。"""
+    if not label:
+        return ""
+    text = str(label).strip()
+    cfg = load_strand_config()
+    strands = cfg.get("strands") or {}
+    for canon, info in strands.items():
+        if text == canon:
+            return canon
+        for alias in (info.get("aliases") or []):
+            if alias and alias in text:
+                return canon
+    # 兜底:正式名直接子串命中
+    for canon in strands.keys():
+        if canon in text:
+            return canon
+    return ""
+
+
+def update_strand_tracker(state: Dict[str, Any], chapter: int, dominant: str) -> None:
+    """把本章 dominant_strand 记进 state['strand_tracker']。dominant 已归一化。
+    无法识别的标签不污染计数器(只记 history,不更新 last_*),保证崩溃重建安全。"""
+    if not dominant:
+        return
+    tracker = state.setdefault("strand_tracker", {})
+    history = tracker.setdefault("history", [])
+    # 去重:同章重复提交只保留最后一次(崩溃重建可能重跑本章)
+    history[:] = [h for h in history if int(h.get("chapter", -1)) != chapter]
+    history.append({"chapter": chapter, "dominant": dominant})
+    history.sort(key=lambda h: int(h.get("chapter", 0)))
+    tracker["history"] = history[-60:]  # 有界:只留最近 60 章
+    key_map = {"道途线": "last_道途", "情义线": "last_情义", "天地线": "last_天地"}
+    field = key_map.get(dominant)
+    if field:
+        tracker[field] = chapter
+    prev_dominant = tracker.get("current_dominant")
+    if prev_dominant == dominant:
+        tracker["consecutive"] = int(tracker.get("consecutive") or 0) + 1
+    else:
+        tracker["consecutive"] = 1
+    tracker["current_dominant"] = dominant
+
+
+def strand_pacing_warnings(chapter: int) -> str:
+    """读 strand_tracker + config,生成三线节奏警告(连续主导/断档/配比失衡)。
+    纯代码、只警告不阻断,与 pacing_variety_warnings 同款模式。给 writer 看。"""
+    cfg = load_strand_config()
+    if not cfg or cfg.get("enabled") is False:
+        return ""
+    strands = cfg.get("strands") or {}
+    state = load_state()
+    tracker = state.get("strand_tracker") or {}
+    history = [h for h in (tracker.get("history") or []) if isinstance(h, dict)]
+    if not history:
+        return ""
+    ramp_up = int(cfg.get("ramp_up_chapters") or 0)
+    warnings: List[str] = []
+    # 1. 连续主导(只对设了 max_consecutive 的线,通常是道途线)
+    cur = tracker.get("current_dominant")
+    consec = int(tracker.get("consecutive") or 0)
+    cur_info = strands.get(cur) or {}
+    max_consec = cur_info.get("max_consecutive")
+    if max_consec and consec >= int(max_consec) and chapter > ramp_up:
+        other = [s for s in strands.keys() if s != cur]
+        warnings.append(
+            f"三线警告:已连续{consec}章以「{cur}」为主导,本章宜让{'/'.join(other)}承重,避免节奏单一"
+        )
+    # 2. 断档(对设了 max_gap 的线)
+    key_map = {"道途线": "last_道途", "情义线": "last_情义", "天地线": "last_天地"}
+    for canon, info in strands.items():
+        max_gap = info.get("max_gap")
+        if not max_gap:
+            continue
+        last = tracker.get(key_map.get(canon, ""))
+        gap = (chapter - int(last)) if last else chapter
+        if gap > int(max_gap) and chapter > ramp_up:
+            warnings.append(
+                f"三线警告:距上次「{canon}」主导已{gap}章(红线{max_gap}),{info.get('desc','')[:20]}——本章可适当带入"
+            )
+    return "\n".join(warnings)
+
+
+def strand_digest_for_director(chapter: int) -> str:
+    """给 story_director 看的三线配比摘要,比 writer 警告更全(含实际占比)。"""
+    cfg = load_strand_config()
+    if not cfg or cfg.get("enabled") is False:
+        return ""
+    strands = cfg.get("strands") or {}
+    state = load_state()
+    tracker = state.get("strand_tracker") or {}
+    history = [h for h in (tracker.get("history") or []) if isinstance(h, dict)]
+    if not history:
+        return ""
+    lookback = int(cfg.get("ratio_lookback") or 20)
+    window = [h for h in history if int(h.get("chapter", 0)) > chapter - lookback]
+    total = len(window) or 1
+    from collections import Counter
+    counts = Counter(normalize_strand(h.get("dominant")) for h in window)
+    lines = [f"【三线配比】最近{len(window)}章:"]
+    for canon, info in strands.items():
+        n = counts.get(canon, 0)
+        ratio = n / total
+        lo = info.get("target_ratio_min", 0)
+        hi = info.get("target_ratio_max", 1)
+        flag = ""
+        if ratio < lo:
+            flag = f" ⚠偏低(目标{int(lo*100)}-{int(hi*100)}%)"
+        elif ratio > hi:
+            flag = f" ⚠偏高(目标{int(lo*100)}-{int(hi*100)}%)"
+        lines.append(f"- {canon}:{n}/{total}={int(ratio*100)}%{flag}")
+    consec = int(tracker.get("consecutive") or 0)
+    cur = tracker.get("current_dominant") or "?"
+    lines.append(f"当前连续主导:「{cur}」×{consec}章")
+    return "\n".join(lines)
+
+
 def pacing_variety_warnings(chapter: int, lookback: int = 10) -> str:
     """Scan recent beats for scene type distribution. Return warnings."""
     beats_dir = BASE_DIR / "beats"
@@ -1637,6 +1764,9 @@ def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
     pacing_warn = pacing_variety_warnings(chapter)
     if pacing_warn:
         sections.append(make_section("节奏多样性警告", pacing_warn, "high", False))
+    strand_warn = strand_pacing_warnings(chapter)
+    if strand_warn:
+        sections.append(make_section("三线节奏警告（道途/情义/天地配比）", strand_warn, "high", False))
     emotion_warn = emotional_distribution_warnings(chapter)
     if emotion_warn:
         sections.append(make_section("情绪分布警告", emotion_warn, "high", False))
@@ -2357,6 +2487,7 @@ def build_story_director_input(chapter: int, detected: Dict[str, Any], run_cfg: 
         make_section("期待账本", read_text(BASE_DIR / "08-期待账本.md"), "high", True),
         make_section("结构化当前状态", structured_state_text(), "high", True),
         make_section("线索与揭示台账", threads_digest_for_director(chapter) or "（暂无线索台账记录）", "high", True),
+        make_section("三线节奏配比", strand_digest_for_director(chapter) or "（暂无三线记录）", "high", True),
         make_section("最近章节正文摘录", recent_text_blob(chapter, lookback=3), "normal", True),
         make_section("最近 beat 摘要", recent_beats_summary(chapter, lookback=5), "normal", True),
     ]
@@ -2975,6 +3106,11 @@ def merge_state_update(update: Dict[str, Any]) -> None:
         existing = threads.setdefault("open_questions", [])
         existing.extend(str(item) for item in open_questions)
         threads["open_questions"] = existing[-30:]
+    # 三线节奏:archivist 打的 dominant_strand 标签 → 更新计数器(归一化后)
+    dominant_raw = update.get("dominant_strand")
+    chapter_no = update.get("_chapter")
+    if dominant_raw and chapter_no:
+        update_strand_tracker(state, int(chapter_no), normalize_strand(dominant_raw))
     dump_json(STATE_FILE, state)
     dump_json(ACTIVE_THREADS_FILE, threads)
     write_state_mirrors()
@@ -3726,6 +3862,7 @@ def apply_archivist_update(chapter: int, archive_report: str) -> None:
         )
 
     structured_update = extract_structured_update(archive_report)
+    structured_update["_chapter"] = chapter  # 供 merge_state_update 更新三线计数器
     # 1. 各层记忆写入（latest_chapter 已从 merge_state_update 剥离）
     merge_state_update(structured_update)
     merge_ledger_update(structured_update, chapter)

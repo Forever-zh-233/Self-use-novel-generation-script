@@ -2821,7 +2821,7 @@ def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None
         arc_input,
         RUNTIME_DIR / "arc_planner_output.md",
         timeout,
-        4000,
+        10000,  # 放宽:弧线现在带 pacing_shape + approach_to_next 走向,内容更长;arc_planner 非每章跑,放宽无每章成本
     )
     try:
         arcs = json.loads(result.strip() if result.strip().startswith("[") else
@@ -2837,22 +2837,52 @@ def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None
 
 
 def active_arcs_for_beat(chapter: int) -> str:
-    """格式化当前活跃弧线给 beat_planner 看:只展示与当前章相关的节点。"""
+    """格式化当前活跃弧线给 beat_planner 看:展示当前所处区段的走向(approach_to_next)
+    + 进度定位(距下个节点几章),让 beat_planner 顺着走向细化本章,不跑偏不打转。"""
     arcs = load_active_arcs()
     if not arcs:
         return ""
-    lines = ["以下是当前活跃的短线弧(3-10章跨度),你的 beat 应该推进其中某条弧的下一个节点:"]
+    lines = ["以下是当前活跃的短线弧。你要顺着弧线的『走向』细化本章,既不能跳步抢节点,也不能原地打转——你在为某个节点做铺垫,要朝那个方向推进:"]
     for arc in arcs:
         nodes = arc.get("nodes") or []
-        relevant = [n for n in nodes if n.get("chapter", 0) >= chapter - 1]
-        if not relevant:
+        if not nodes:
+            continue
+        # 找出当前章落在哪两个节点之间(所处区段)
+        sorted_nodes = sorted(nodes, key=lambda n: int(n.get("chapter", 0) or 0))
+        prev_node = None
+        next_node = None
+        for n in sorted_nodes:
+            nch = int(n.get("chapter", 0) or 0)
+            if nch <= chapter:
+                prev_node = n
+            elif next_node is None:
+                next_node = n
+        relevant = [n for n in sorted_nodes if int(n.get("chapter", 0) or 0) >= chapter - 1]
+        if not relevant and not prev_node:
             continue
         lines.append(f"\n### {arc.get('title', '?')}({arc.get('type', '?')}) [{arc.get('arc_id', '')}]")
         lines.append(f"目标:{arc.get('summary', '')}")
+        shape = arc.get("pacing_shape")
+        if shape:
+            lines.append(f"整弧呼吸:{shape}")
         lines.append(f"收束条件:{arc.get('resolution_condition', '未明确')}")
+        # 进度定位 + 本段走向(核心:让 beat_planner 知道自己在哪、该往哪走)
+        if next_node is not None:
+            gap = int(next_node.get("chapter", 0) or 0) - chapter
+            lines.append(
+                f"▶ 本章进度:你正处在「{(prev_node or {}).get('beat_hint','起点')[:18]}」之后、"
+                f"下一个节点「{next_node.get('beat_hint','?')[:24]}」(第{next_node.get('chapter','?')}章[{next_node.get('tension','?')}])之前,还差约{gap}章到下个节点。"
+            )
+            approach = (prev_node or {}).get("approach_to_next")
+            if approach:
+                lines.append(f"★ 本段走向(顺着它铺,别跳步别打转):{approach}")
+            elif gap >= 2:
+                lines.append("★ 本段走向:弧线未给明确走向,按整弧呼吸自行把握铺垫节奏,循序逼近下个节点。")
+        else:
+            lines.append(f"▶ 本章已到/越过本弧最后节点「{(prev_node or {}).get('beat_hint','?')[:24]}」,准备收束。")
         lines.append("节点:")
         for n in relevant[:4]:
-            marker = "→" if n.get("chapter") == chapter else " "
+            marker = "→" if int(n.get("chapter", 0) or 0) == chapter else " "
             lines.append(f"  {marker} 第{n.get('chapter', '?')}章 [{n.get('tension', '?')}] {n.get('beat_hint', '')}")
     return "\n".join(lines)
 

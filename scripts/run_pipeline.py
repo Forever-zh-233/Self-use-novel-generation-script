@@ -2284,7 +2284,8 @@ def make_review_input(
     sections = [
         make_section("故事总监批注", story_director_context(chapter), "critical", False),
         make_section("风格指南", read_text(BASE_DIR / "01-风格指南.md"), "critical", False),
-        make_section("打分表", read_text(BASE_DIR / "06-验证打分表.md"), "critical", False),
+        # 注:旧的 06-验证打分表.md(7项/30)曾在此注入,但 reviewer.md 系统提示本身已含完整
+        # 12项/60 rubric,两者数字打架且冗余。#6 统一为单一权威(reviewer.md),此处不再注入打分表。
         make_section("AI腔黑名单", read_text(BASE_DIR / "12-AI腔黑名单.md"), "critical", False),
         make_section(
             "脚本硬检查结果",
@@ -2297,7 +2298,9 @@ def make_review_input(
     return compress_sections_if_needed("reviewer", chapter, sections, run_cfg, timeout)
 
 
-def parse_score_needs_revision(review: str) -> bool:
+def _parse_review_keywords(review: str) -> bool:
+    """关键词 fallback:JSON 解析失败时,从文字报告里捞硬性必修信号。
+    这是 #6 之前唯一在跑的机制,现降级为兜底第二条腿。"""
     return any(flag in review for flag in [
         "必须修改",
         "不合格",
@@ -2310,6 +2313,54 @@ def parse_score_needs_revision(review: str) -> bool:
         "解释型对话",
         "过度工整",
     ])
+
+
+def parse_review_verdict(review: str) -> Dict[str, Any]:
+    """解析 reviewer 双轨输出:优先读结构化 JSON 判定块,失败则回退关键词匹配。
+    边界处理(主链,已与用户敲定):
+      ① JSON 合法 → 读 needs_revision/total/blockers
+      ② markdown包裹/尾逗号 → 复用 _sanitize_model_json 代码洗一遍(不重调模型)
+      ③ 洗完仍失败 → fallback 关键词匹配(_parse_review_keywords)
+      ④ 关键词也没命中 → 默认放行(needs_revision=False),靠后续 final_gate 兜硬伤
+    返回 {needs_revision, total, blockers, source}。source 标明判定来自 json/keyword,便于排查。"""
+    # 优先抓第一个 ```json 围栏块(reviewer 输出 JSON 在前、markdown 在后,不能用 first{..last})
+    block = None
+    m = re.search(r"```json\s*(\{.*?\})\s*```", review, re.DOTALL)
+    if m:
+        block = m.group(1)
+    else:
+        # 没围栏:退而求其次,抓第一个 { 到与之匹配的 }(粗取,靠 sanitize 兜)
+        start = review.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(review)):
+                if review[i] == "{":
+                    depth += 1
+                elif review[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        block = review[start:i + 1]
+                        break
+    if block:
+        for candidate in (block, _sanitize_model_json(block)):
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and "needs_revision" in data:
+                    return {
+                        "needs_revision": bool(data.get("needs_revision")),
+                        "total": data.get("total"),
+                        "blockers": data.get("blockers") or [],
+                        "source": "json",
+                    }
+            except (json.JSONDecodeError, ValueError):
+                continue
+    # ③④ 解析失败:回退关键词;命中=必修,没命中=默认放行
+    kw = _parse_review_keywords(review)
+    return {"needs_revision": kw, "total": None, "blockers": [], "source": "keyword"}
+
+
+def parse_score_needs_revision(review: str) -> bool:
+    return parse_review_verdict(review)["needs_revision"]
 
 
 def needs_revision(gate: Dict[str, Any], review: str) -> bool:
@@ -4417,8 +4468,19 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
     stage_done(chapter, "reviewer", "评审", 4, total_steps, started)
     time.sleep(sleep_seconds)
 
+    # #6:解析 reviewer 双轨输出的结构化判定块,落盘存档(纯诊断,不回灌任何角色)。
+    verdict = parse_review_verdict(review)
+    dump_json(role_artifact("reviewer", chapter, "review_verdict.json"), verdict)
+    if verdict.get("source") == "keyword":
+        cli_print(f"[reviewer] 第{chapter}章:JSON判定块解析失败,已回退关键词匹配(needs_revision={verdict['needs_revision']})。")
+    else:
+        total = verdict.get("total")
+        cli_print(f"[reviewer] 第{chapter}章:总分{total if total is not None else '?'}/60,needs_revision={verdict['needs_revision']}。")
+        for b in (verdict.get("blockers") or [])[:5]:
+            cli_print(f"  阻断:{b}")
+
     final = draft
-    if max_revisions > 0 and needs_revision(gate, review):
+    if max_revisions > 0 and ((not gate.get("passed")) or verdict.get("needs_revision")):
         wait_if_paused("Editor 修稿前")
         started = stage_start(chapter, "editor", "修稿", 5, total_steps, chapter_index, total_chapters)
         editor_prompt = (

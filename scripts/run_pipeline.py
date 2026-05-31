@@ -1775,9 +1775,6 @@ def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
     pacing_warn = pacing_variety_warnings(chapter)
     if pacing_warn:
         sections.append(make_section("节奏多样性警告", pacing_warn, "high", False))
-    strand_warn = strand_pacing_warnings(chapter)
-    if strand_warn:
-        sections.append(make_section("三线节奏参考（道途/情义/天地，仅供参考非硬指标）", strand_warn, "normal", True))
     emotion_warn = emotional_distribution_warnings(chapter)
     if emotion_warn:
         sections.append(make_section("情绪分布警告", emotion_warn, "high", False))
@@ -2798,6 +2795,14 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
         make_section("期待账本(未回收伏笔)", read_text(BASE_DIR / "08-期待账本.md"), "normal", True),
         make_section("最近章节 beat 回顾", recent_beats_summary(chapter), "normal", True),
     ]
+    # 三线配比给中期规划师:规划这一弧(几十章)时,决定该弧要补情义/天地,平衡道途独大
+    strand_digest = strand_digest_for_director(chapter)
+    if strand_digest:
+        sections.append(make_section(
+            "三线节奏配比(规划弧线时统筹道途/情义/天地的平衡)",
+            strand_digest,
+            "normal", True,
+        ))
     return compress_sections_if_needed("arc_planner", chapter, sections, run_cfg, timeout)
 
 
@@ -2876,6 +2881,18 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
     emotion_warn = emotional_distribution_warnings(chapter)
     if emotion_warn:
         sections.append(make_section("情绪分布警告", emotion_warn, "high", False))
+    # 三线节奏(道途/情义/天地):给规划师看配比+断档,决定本章「推进的线」该走哪条。
+    # 关键:信号只给规划层(此处+arc_planner),不给writer——节奏平衡是规划的活,
+    # 给writer会导致单章视角硬塞。规划师统筹几十章,会安排到合适章节而非挤进本章。
+    strand_digest = strand_digest_for_director(chapter)
+    strand_warn = strand_pacing_warnings(chapter)
+    strand_parts = [p for p in [strand_digest, strand_warn] if p]
+    if strand_parts:
+        sections.append(make_section(
+            "三线节奏配比(规划本章「推进的线」时参考)",
+            "\n".join(strand_parts),
+            "high", True,
+        ))
     # 可回响的情感锚点(让规划师在合适时机安排回响)
     ea_text = emotional_anchors_for_planner(chapter)
     if ea_text:

@@ -57,6 +57,36 @@ VERSION_DIR = BASE_DIR / "台账版本"
 LONG_FORESHADOWING_FILE = BASE_DIR / "15-长线伏笔资产库.md"
 
 
+def load_env_local() -> int:
+    """启动时自动加载 BASE_DIR/.env.local 到 os.environ。
+    API key 只存在 gitignored 的 .env.local,但 get_api_key 从环境变量读、不自动加载。
+    没有它,每个新终端启动管线都得手动 `source .env.local`,忘了就 401。
+    规则:① 文件不存在就静默跳过;② 已存在的环境变量优先,不覆盖(手动 export 仍可压过文件);
+    ③ 解析 KEY=VALUE,跳过空行/注释行/无等号行;④ 去掉值两端引号;⑤ 绝不打印 key 值。
+    返回新注入的变量个数。"""
+    env_file = BASE_DIR / ".env.local"
+    if not env_file.exists():
+        return 0
+    injected = 0
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if not key or key in os.environ:  # 已设的不覆盖
+                continue
+            value = value.strip().strip('"').strip("'")
+            os.environ[key] = value
+            injected += 1
+    except OSError:
+        return injected
+    return injected
+
+
 def manuscript_path(chapter: int) -> Path:
     return ARTICLE_DIR / f"第{chapter:03d}章.md"
 
@@ -4962,6 +4992,8 @@ def split_and_write_technique_chunks(reduce_text: str) -> List[str]:
 
 
 def main() -> None:
+    # 最先加载 .env.local 到环境变量(API key 在此),否则新终端启动会因 key 缺失 401。
+    n_env = load_env_local()
     parser = argparse.ArgumentParser(description="端到端小说流水线（API版）")
     parser.add_argument("--config", help="运行配置 JSON，默认 config/run.json")
     parser.add_argument("--chapter", type=int, help="覆盖 run.json 的 start_chapter")
@@ -4972,6 +5004,8 @@ def main() -> None:
     parser.add_argument("--outline", action="store_true", help="一次性：生成全书骨架（开新书时跑一次）")
     parser.add_argument("--no-cli", action="store_true", help="减少终端提示")
     args = parser.parse_args()
+    if n_env and not getattr(args, "no_cli", False):
+        cli_print(f"已从 .env.local 加载 {n_env} 个环境变量（含 API key，值不显示）。")
 
     run_cfg = load_run_config(args.config)
     if args.dry_run:

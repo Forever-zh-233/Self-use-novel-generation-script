@@ -1,0 +1,35 @@
+# === 密钥 / 本地环境（绝不进仓库）===
+.env
+.env.local
+*.key
+*.secret
+
+# === 源文素材（他人作品全文，只读素材，不纳入版本）===
+271824.txt
+*.txt
+!README*.txt
+
+# === 运行态产物（每跑一章都变，由管线生成）===
+runtime/
+输出/
+beats/
+
+# === 中间产物 / 历史快照（可重新生成）===
+分析草稿/
+台账版本/
+
+# === Python 缓存 ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# === 编辑器 / 系统 ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.tmp
+*.bak
+*_重写版.md

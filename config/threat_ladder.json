@@ -1,0 +1,21 @@
+{
+  "_usage_note": "威胁升级阶梯。beat_planner和arc_planner参考此表决定敌人强度,防止战力膨胀。writer不读此文件。",
+  "escalation_rules": [
+    "本卷最强敌人不超过ceiling境界",
+    "BOSS战前必须有至少2次低级遭遇铺垫",
+    "同一敌人不能连续3章出现(给读者喘息)",
+    "每卷结束时威胁等级上升一阶",
+    "不能出现主角碾压全场的情况超过2章(爽完要有新挑战)",
+    "群战优先于单挑(更有张力,也更合理)"
+  ],
+  "ladder": [
+    {"volume": 1, "chapters": "1-100", "mc_realm": "凡人→叩门", "enemy_floor": "凡人", "enemy_ceiling": "通脉初期", "boss": "通脉中期(一个)", "notes": "主要威胁是人(帮派/巡夜司末端),偶有低阶妖祟"},
+    {"volume": 2, "chapters": "101-200", "mc_realm": "叩门→通脉", "enemy_floor": "叩门", "enemy_ceiling": "通脉后期", "boss": "凝元初期", "notes": "蛊师/邪修为主,开始接触修士圈"},
+    {"volume": 3, "chapters": "201-300", "mc_realm": "通脉→凝元", "enemy_floor": "通脉", "enemy_ceiling": "凝元后期", "boss": "开窍初期", "notes": "正式修士交手,巡夜司中层"},
+    {"volume": 4, "chapters": "301-400", "mc_realm": "凝元→开窍", "enemy_floor": "凝元", "enemy_ceiling": "开窍后期", "boss": "化神初期(陆鸣)", "notes": "云京权力斗争,组织级对抗"},
+    {"volume": 5, "chapters": "401-500", "mc_realm": "开窍→化神", "enemy_floor": "开窍", "enemy_ceiling": "化神后期", "boss": "归真初期(妖族首领)", "notes": "妖潮+多方混战"},
+    {"volume": 6, "chapters": "501-620", "mc_realm": "化神→归真前期", "enemy_floor": "化神", "enemy_ceiling": "归真中期", "boss": "归真后期(陆鸣全力)", "notes": "最终对决,体制瓦解"},
+    {"volume": 7, "chapters": "621-740", "mc_realm": "归真→归真巅峰", "enemy_floor": "无传统敌人", "enemy_ceiling": "世界规则本身", "boss": "世界裂缝(非人形)", "notes": "修补世界,敌人是自然灾害级"},
+    {"volume": 8, "chapters": "741-800", "mc_realm": "归真巅峰", "enemy_floor": "无", "enemy_ceiling": "无", "boss": "无", "notes": "无战斗卷,写长生本身"}
+  ]
+}

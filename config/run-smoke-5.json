@@ -1,0 +1,32 @@
+{
+  "run": {
+    "start_chapter": 1,
+    "chapter_count": 5,
+    "max_chapters_per_run": 5,
+    "auto_generate_beat": true,
+    "beat_template": "E:/Novel 1/beats/chapter_{chapter}.json",
+    "max_revisions": 1,
+    "apply_archivist_updates": true,
+    "default_context_window_tokens": 200000,
+    "compress_at_ratio": 0.8,
+    "context_windows": {
+      "beat_planner": 200000,
+      "writer": 200000,
+      "reviewer": 200000,
+      "editor": 200000,
+      "archivist": 200000,
+      "compressor": 200000
+    },
+    "max_input_tokens": {
+      "beat_planner": 18000,
+      "writer": 22000,
+      "reviewer": 18000,
+      "editor": 18000,
+      "archivist": 18000,
+      "compressor": 18000
+    },
+    "request_timeout_seconds": 180,
+    "sleep_seconds_between_calls": 1,
+    "dry_run": false
+  }
+}

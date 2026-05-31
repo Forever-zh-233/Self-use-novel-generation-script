@@ -1,0 +1,104 @@
+{
+  "说明": "把 key 填在 providers.*.api_key，或把 api_key_env 改成你的环境变量名。每个角色在 roles 里选择 provider 和 model。",
+  "defaultProvider": "mimo_main",
+  "providers": {
+    "openai_main": {
+      "说明": "官方 OpenAI Responses API。base_url 通常保持 https://api.openai.com/v1。",
+      "type": "openai_responses",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "openai_compatible": {
+      "说明": "OpenAI 兼容格式，适合大多数第三方 /v1/chat/completions 服务。",
+      "type": "openai_chat",
+      "base_url": "https://YOUR_OPENAI_COMPATIBLE_HOST/v1",
+      "api_key": "",
+      "api_key_env": ""
+    },
+    "anthropic_main": {
+      "说明": "Anthropic Messages API。base_url 通常保持 https://api.anthropic.com。",
+      "type": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "anthropic_version": "2023-06-01"
+    },
+    "mimo_main": {
+      "说明": "小米 Mimo / Token Plan OpenAI-compatible 接口。",
+      "type": "openai_chat",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "api_key": "",
+      "api_key_env": "MIMO_API_KEY",
+      "max_tokens_field": "max_completion_tokens",
+      "extra_body": {
+        "thinking": {
+          "type": "disabled"
+        },
+        "stream": false
+      }
+    }
+  },
+  "roles": {
+    "arc_planner": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 4000
+    },
+    "story_director": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 2000
+    },
+    "fact_checker": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 3000
+    },
+    "volume_planner": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 5000
+    },
+    "master_outline": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 7000
+    },
+    "analyst": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 7000
+    },
+    "beat_planner": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 1800
+    },
+    "writer": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 7000
+    },
+    "reviewer": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 3000
+    },
+    "editor": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 7000
+    },
+    "archivist": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 20000
+    },
+    "compressor": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 3000
+    }
+  }
+}

@@ -1,0 +1,382 @@
+{
+  "黄金法则": {
+    "file": "chunk_黄金法则.md",
+    "tokens": 768,
+    "category": "必选"
+  },
+  "沈安": {
+    "file": "chunk_沈安.md",
+    "tokens": 225,
+    "category": "角色"
+  },
+  "黑子": {
+    "file": "chunk_黑子.md",
+    "tokens": 138,
+    "category": "角色"
+  },
+  "裴照": {
+    "file": "chunk_裴照.md",
+    "tokens": 192,
+    "category": "角色"
+  },
+  "小满": {
+    "file": "chunk_小满.md",
+    "tokens": 144,
+    "category": "角色"
+  },
+  "方绾": {
+    "file": "chunk_方绾.md",
+    "tokens": 135,
+    "category": "角色"
+  },
+  "通用规则": {
+    "file": "chunk_通用规则.md",
+    "tokens": 178,
+    "category": "角色"
+  },
+  "打斗场景": {
+    "file": "chunk_打斗场景.md",
+    "tokens": 178,
+    "category": "场景"
+  },
+  "日常对话": {
+    "file": "chunk_日常对话.md",
+    "tokens": 156,
+    "category": "场景"
+  },
+  "情绪爆发": {
+    "file": "chunk_情绪爆发.md",
+    "tokens": 133,
+    "category": "场景"
+  },
+  "景物描写": {
+    "file": "chunk_景物描写.md",
+    "tokens": 124,
+    "category": "场景"
+  },
+  "人物初登场": {
+    "file": "chunk_人物初登场.md",
+    "tokens": 136,
+    "category": "场景"
+  },
+  "章末钩子": {
+    "file": "chunk_章末钩子.md",
+    "tokens": 111,
+    "category": "场景"
+  },
+  "系统面板": {
+    "file": "chunk_系统面板.md",
+    "tokens": 120,
+    "category": "场景"
+  },
+  "转场": {
+    "file": "chunk_转场.md",
+    "tokens": 99,
+    "category": "场景"
+  },
+  "群像互动": {
+    "file": "chunk_群像互动.md",
+    "tokens": 148,
+    "category": "场景"
+  },
+  "内心独白": {
+    "file": "chunk_内心独白.md",
+    "tokens": 106,
+    "category": "场景"
+  },
+  "反派压迫": {
+    "file": "chunk_反派压迫.md",
+    "tokens": 130,
+    "category": "场景"
+  },
+  "喜剧缓冲": {
+    "file": "chunk_喜剧缓冲.md",
+    "tokens": 211,
+    "category": "场景"
+  },
+  "负空间": {
+    "file": "chunk_负空间.md",
+    "tokens": 651,
+    "category": "必选"
+  },
+  "AI腔黑名单": {
+    "file": "chunk_AI腔黑名单.md",
+    "tokens": 1509,
+    "category": "必选"
+  },
+  "世界观圣经_0": {
+    "file": "chunk_世界观圣经_0.md",
+    "tokens": 15,
+    "category": "世界观圣经"
+  },
+  "世界观圣经_项目定位": {
+    "file": "chunk_世界观圣经_项目定位.md",
+    "tokens": 94,
+    "category": "世界观圣经"
+  },
+  "世界观圣经_世界架构": {
+    "file": "chunk_世界观圣经_世界架构.md",
+    "tokens": 393,
+    "category": "世界观圣经"
+  },
+  "世界观圣经_修炼体系": {
+    "file": "chunk_世界观圣经_修炼体系.md",
+    "tokens": 456,
+    "category": "世界观圣经"
+  },
+  "世界观圣经_主角设定": {
+    "file": "chunk_世界观圣经_主角设定.md",
+    "tokens": 250,
+    "category": "世界观圣经"
+  },
+  "世界观圣经_核心设定": {
+    "file": "chunk_世界观圣经_核心设定.md",
+    "tokens": 204,
+    "category": "世界观圣经"
+  },
+  "世界观圣经_禁忌事项": {
+    "file": "chunk_世界观圣经_禁忌事项.md",
+    "tokens": 112,
+    "category": "世界观圣经"
+  },
+  "章节协议_0": {
+    "file": "chunk_章节协议_0.md",
+    "tokens": 28,
+    "category": "章节协议"
+  },
+  "章节协议_本章信息": {
+    "file": "chunk_章节协议_本章信息.md",
+    "tokens": 354,
+    "category": "章节协议"
+  },
+  "章节协议_写作检查清单": {
+    "file": "chunk_章节协议_写作检查清单.md",
+    "tokens": 244,
+    "category": "章节协议"
+  },
+  "打分表_0": {
+    "file": "chunk_打分表_0.md",
+    "tokens": 27,
+    "category": "打分表"
+  },
+  "打分表_评分标准": {
+    "file": "chunk_打分表_评分标准.md",
+    "tokens": 1143,
+    "category": "打分表"
+  },
+  "打分表_评分汇总": {
+    "file": "chunk_打分表_评分汇总.md",
+    "tokens": 79,
+    "category": "打分表"
+  },
+  "打分表_评分说明": {
+    "file": "chunk_打分表_评分说明.md",
+    "tokens": 127,
+    "category": "打分表"
+  },
+  "状态台账_0": {
+    "file": "chunk_状态台账_0.md",
+    "tokens": 52,
+    "category": "状态台账"
+  },
+  "状态台账_当前状态": {
+    "file": "chunk_状态台账_当前状态.md",
+    "tokens": 490,
+    "category": "状态台账"
+  },
+  "状态台账_更新日志": {
+    "file": "chunk_状态台账_更新日志.md",
+    "tokens": 34,
+    "category": "状态台账"
+  },
+  "期待账本_0": {
+    "file": "chunk_期待账本_0.md",
+    "tokens": 70,
+    "category": "期待账本"
+  },
+  "期待账本_活跃期待": {
+    "file": "chunk_期待账本_活跃期待.md",
+    "tokens": 63,
+    "category": "期待账本"
+  },
+  "期待账本_类型说明": {
+    "file": "chunk_期待账本_类型说明.md",
+    "tokens": 102,
+    "category": "期待账本"
+  },
+  "期待账本_更新规则": {
+    "file": "chunk_期待账本_更新规则.md",
+    "tokens": 168,
+    "category": "期待账本"
+  },
+  "故事核_0": {
+    "file": "chunk_故事核_0.md",
+    "tokens": 9,
+    "category": "故事核"
+  },
+  "故事核_项目定位": {
+    "file": "chunk_故事核_项目定位.md",
+    "tokens": 94,
+    "category": "故事核"
+  },
+  "故事核_一句话故事": {
+    "file": "chunk_故事核_一句话故事.md",
+    "tokens": 91,
+    "category": "故事核"
+  },
+  "故事核_主角": {
+    "file": "chunk_故事核_主角.md",
+    "tokens": 183,
+    "category": "故事核"
+  },
+  "故事核_金手指": {
+    "file": "chunk_故事核_金手指.md",
+    "tokens": 580,
+    "category": "故事核"
+  },
+  "故事核_修炼体系": {
+    "file": "chunk_故事核_修炼体系.md",
+    "tokens": 457,
+    "category": "故事核"
+  },
+  "故事核_核心伙伴": {
+    "file": "chunk_故事核_核心伙伴.md",
+    "tokens": 81,
+    "category": "故事核"
+  },
+  "故事核_故事结构": {
+    "file": "chunk_故事核_故事结构.md",
+    "tokens": 240,
+    "category": "故事核"
+  },
+  "故事核_主线冲突": {
+    "file": "chunk_故事核_主线冲突.md",
+    "tokens": 172,
+    "category": "故事核"
+  },
+  "故事核_第一卷方向": {
+    "file": "chunk_故事核_第一卷方向.md",
+    "tokens": 117,
+    "category": "故事核"
+  },
+  "故事核_读者期待": {
+    "file": "chunk_故事核_读者期待.md",
+    "tokens": 147,
+    "category": "故事核"
+  },
+  "故事核_禁止方向": {
+    "file": "chunk_故事核_禁止方向.md",
+    "tokens": 78,
+    "category": "故事核"
+  },
+  "卷纲_0": {
+    "file": "chunk_卷纲_0.md",
+    "tokens": 3,
+    "category": "卷纲"
+  },
+  "卷纲_第一卷：北砚客途": {
+    "file": "chunk_卷纲_第一卷：北砚客途.md",
+    "tokens": 252,
+    "category": "卷纲"
+  },
+  "卷纲_漂泊结构（本卷三段弧）": {
+    "file": "chunk_卷纲_漂泊结构（本卷三段弧）.md",
+    "tokens": 232,
+    "category": "卷纲"
+  },
+  "卷纲_第一卷阶段规划": {
+    "file": "chunk_卷纲_第一卷阶段规划.md",
+    "tokens": 670,
+    "category": "卷纲"
+  },
+  "卷纲_伏笔规划": {
+    "file": "chunk_卷纲_伏笔规划.md",
+    "tokens": 135,
+    "category": "卷纲"
+  },
+  "卷纲_卷级爽点": {
+    "file": "chunk_卷纲_卷级爽点.md",
+    "tokens": 139,
+    "category": "卷纲"
+  },
+  "卷纲_节奏规则": {
+    "file": "chunk_卷纲_节奏规则.md",
+    "tokens": 163,
+    "category": "卷纲"
+  },
+  "情感高潮手法": {
+    "file": "chunk_情感高潮手法.md",
+    "tokens": 1198,
+    "category": "手法"
+  },
+  "铺垫手法": {
+    "file": "chunk_铺垫手法.md",
+    "tokens": 1285,
+    "category": "手法"
+  },
+  "节奏控制手法": {
+    "file": "chunk_节奏控制手法.md",
+    "tokens": 1427,
+    "category": "手法"
+  },
+  "潜台词": {
+    "file": "chunk_潜台词.md",
+    "tokens": 520,
+    "category": "手法"
+  },
+  "场景价值转变": {
+    "file": "chunk_场景价值转变.md",
+    "tokens": 450,
+    "category": "手法"
+  },
+  "情感回响手法": {
+    "file": "chunk_情感回响手法.md",
+    "tokens": 1138,
+    "category": "情感技法"
+  },
+  "克制与留白": {
+    "file": "chunk_克制与留白.md",
+    "tokens": 1002,
+    "category": "情感技法"
+  },
+  "意难平": {
+    "file": "chunk_意难平.md",
+    "tokens": 783,
+    "category": "情感技法"
+  },
+  "主角能动性": {
+    "file": "chunk_主角能动性.md",
+    "tokens": 693,
+    "category": "精品手法"
+  },
+  "具体与投放": {
+    "file": "chunk_具体与投放.md",
+    "tokens": 641,
+    "category": "精品手法"
+  },
+  "反讽落差": {
+    "file": "chunk_反讽落差.md",
+    "tokens": 740,
+    "category": "精品手法"
+  },
+  "后续与微张力": {
+    "file": "chunk_后续与微张力.md",
+    "tokens": 657,
+    "category": "精品手法"
+  },
+  "主题对位": {
+    "file": "chunk_主题对位.md",
+    "tokens": 769,
+    "category": "精品手法"
+  },
+  "自欺与道德灰度": {
+    "file": "chunk_自欺与道德灰度.md",
+    "tokens": 832,
+    "category": "精品手法"
+  },
+  "升级代价": {
+    "file": "chunk_升级代价.md",
+    "tokens": 774,
+    "category": "精品手法"
+  }
+}

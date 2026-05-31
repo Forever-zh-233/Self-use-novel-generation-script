@@ -1610,29 +1610,29 @@ def pacing_variety_warnings(chapter: int, lookback: int = 10) -> str:
 
 
 def emotional_distribution_warnings(chapter: int, lookback: int = 10) -> str:
-    """Check emotion variety from recent beats."""
+    """检测最近 lookback 章的情绪基调是否过度单调。
+    架构与三线占比/场景类型一致:语义判断归 LLM(beat_planner 在 beat 里写「情绪基调」),
+    代码只数标签、不做任何关键词语义猜测。只警告不阻断,只给规划层(beat_planner)看。"""
     beats_dir = BASE_DIR / "beats"
     tones = []
     for ch in range(max(1, chapter - lookback), chapter):
         beat_path = beats_dir / f"chapter_{ch}.json"
         if beat_path.exists():
             beat = load_json(beat_path, {})
-            conflict = beat.get("本章冲突", "") + beat.get("本章爽点", "")
-            if any(w in conflict for w in ["紧张", "危险", "逼迫", "追", "打", "杀", "逃"]):
-                tones.append("紧张")
-            elif any(w in conflict for w in ["温暖", "感动", "信任", "帮", "救"]):
-                tones.append("温暖")
-            elif any(w in conflict for w in ["愤怒", "不甘", "屈辱", "恨"]):
-                tones.append("愤怒")
-            else:
-                tones.append("中性")
-    if not tones:
+            tone = str(beat.get("情绪基调") or "").strip()
+            # 没写情绪基调的章节(旧 beat 或留空)直接跳过,不替它猜
+            if tone and tone != "无":
+                tones.append(tone)
+    if len(tones) < 4:  # 样本太少不警告,避免开局就纠偏
         return ""
     from collections import Counter
     counts = Counter(tones)
     dominant = counts.most_common(1)
     if dominant and dominant[0][1] >= len(tones) * 0.7:
-        return f"情绪警告：最近{len(tones)}章中「{dominant[0][0]}」情绪占{dominant[0][1]}/{len(tones)}，建议本章调节情绪基调"
+        return (
+            f"情绪基调提示:最近{len(tones)}章里「{dominant[0][0]}」占了{dominant[0][1]}/{len(tones)}。"
+            "若后续仍顺其自然偏这个基调也无妨,但有合适契机时可调一调冷热,别让读者长期绷在同一种情绪上。"
+        )
     return ""
 
 
@@ -1771,13 +1771,10 @@ def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
     sig_warn = recent_signature_warnings(chapter)
     if sig_warn:
         sections.append(make_section("近期重复动作禁用清单", sig_warn, "critical", False))
-    # Pacing + emotion warnings (Change 11)
-    pacing_warn = pacing_variety_warnings(chapter)
-    if pacing_warn:
-        sections.append(make_section("节奏多样性警告", pacing_warn, "high", False))
-    emotion_warn = emotional_distribution_warnings(chapter)
-    if emotion_warn:
-        sections.append(make_section("情绪分布警告", emotion_warn, "high", False))
+    # 注:节奏多样性/情绪分布警告"曾"在此注入,现已移除——它们统计的是「场景类型/情绪基调」
+    # 这类由 beat 决定、跨几十章摊平的分布属性,属规划层(beat_planner)的活。给单章视角的
+    # writer 看会逼它硬切场景/硬调情绪(与三线占比同款矫枉过正)。信号只保留在 beat_planner。
+    # writer 仍保留 recent_signature_warnings,因为那是正文字句层的重复,确属 writer 掌控。
     # Motifs relevant to this chapter (Change 5)
     ledger_data = load_ledger()
     motifs = ledger_data.get("motifs") or []
@@ -2989,6 +2986,7 @@ def normalize_beat(chapter: int, beat: Dict[str, Any]) -> Dict[str, Any]:
         "矛盾触发",
         "情绪裂缝",
         "情绪弧线",
+        "情绪基调",
     ]:
         if key in beat:
             normalized[key] = str(beat.get(key) or "无")

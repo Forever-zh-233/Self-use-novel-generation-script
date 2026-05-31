@@ -1,0 +1,8 @@
+# 统一换行：仓库内用 LF，检出时由各自系统处理，避免 CRLF/LF 反复触发 diff
+* text=auto eol=lf
+
+# 明确二进制，避免被当文本改换行
+*.png binary
+*.jpg binary
+*.gz binary
+*.zip binary

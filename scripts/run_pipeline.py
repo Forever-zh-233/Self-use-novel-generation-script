@@ -1512,18 +1512,23 @@ def strand_pacing_warnings(chapter: int) -> str:
     if not history:
         return ""
     ramp_up = int(cfg.get("ramp_up_chapters") or 0)
+    cooldown = max(1, int(cfg.get("nag_cooldown") or 1))
     warnings: List[str] = []
-    # 1. 连续主导(只对设了 max_consecutive 的线,通常是道途线)
+    # 1. 连续主导(只对设了 max_consecutive 的线,通常是道途线)。软提示:给契机不下命令。
     cur = tracker.get("current_dominant")
     consec = int(tracker.get("consecutive") or 0)
     cur_info = strands.get(cur) or {}
     max_consec = cur_info.get("max_consecutive")
     if max_consec and consec >= int(max_consec) and chapter > ramp_up:
-        other = [s for s in strands.keys() if s != cur]
-        warnings.append(
-            f"三线警告:已连续{consec}章以「{cur}」为主导,本章宜让{'/'.join(other)}承重,避免节奏单一"
-        )
-    # 2. 断档(对设了 max_gap 的线)
+        # 冷却:跨线后第1章喊,之后每隔 cooldown 章才再喊,避免连环催
+        over = consec - int(max_consec)
+        if over % cooldown == 0:
+            other = [s for s in strands.keys() if s != cur]
+            warnings.append(
+                f"三线提示:已连续{consec}章以「{cur}」为主导。若本章有自然契机,可让{'/'.join(other)}承重换口气;"
+                f"没有合适契机就别硬转,顺其自然。"
+            )
+    # 2. 断档(对设了 max_gap 的线)。同样软化+冷却,绝不要求每章硬塞。
     key_map = {"道途线": "last_道途", "情义线": "last_情义", "天地线": "last_天地"}
     for canon, info in strands.items():
         max_gap = info.get("max_gap")
@@ -1532,9 +1537,15 @@ def strand_pacing_warnings(chapter: int) -> str:
         last = tracker.get(key_map.get(canon, ""))
         gap = (chapter - int(last)) if last else chapter
         if gap > int(max_gap) and chapter > ramp_up:
-            warnings.append(
-                f"三线警告:距上次「{canon}」主导已{gap}章(红线{max_gap}),{info.get('desc','')[:20]}——本章可适当带入"
-            )
+            # 冷却:跨红线后第1章喊,之后每 cooldown 章才再喊一次
+            over = gap - int(max_gap) - 1
+            if over % cooldown == 0:
+                warnings.append(
+                    f"三线提示:「{canon}」已{gap}章没作为主导出现({info.get('desc','')[:16]})。"
+                    f"如后续有合适契机不妨带入一笔,不必为凑配比硬塞——契机比配比重要。"
+                )
+    if warnings:
+        warnings.insert(0, "（三线是几十章自然摊平的节奏参考,不是每章KPI;一章只主推一条很正常,下面只是提个醒,有契机才用。）")
     return "\n".join(warnings)
 
 
@@ -1766,7 +1777,7 @@ def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
         sections.append(make_section("节奏多样性警告", pacing_warn, "high", False))
     strand_warn = strand_pacing_warnings(chapter)
     if strand_warn:
-        sections.append(make_section("三线节奏警告（道途/情义/天地配比）", strand_warn, "high", False))
+        sections.append(make_section("三线节奏参考（道途/情义/天地，仅供参考非硬指标）", strand_warn, "normal", True))
     emotion_warn = emotional_distribution_warnings(chapter)
     if emotion_warn:
         sections.append(make_section("情绪分布警告", emotion_warn, "high", False))

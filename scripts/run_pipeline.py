@@ -2987,6 +2987,7 @@ def normalize_beat(chapter: int, beat: Dict[str, Any]) -> Dict[str, Any]:
         "情绪裂缝",
         "情绪弧线",
         "情绪基调",
+        "钩子型",
     ]:
         if key in beat:
             normalized[key] = str(beat.get(key) or "无")

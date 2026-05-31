@@ -450,6 +450,43 @@ def cleanup_empty_output_dirs() -> None:
             pass
 
 
+SCORE_REPORT_DIR = OUTPUT_DIR / "分数表"
+
+
+def write_score_report(chapter: int, verdict: Dict[str, Any]) -> None:
+    """把 reviewer 的本章评分写成简要报告,存到 输出/分数表/ 第NNN章.md。
+    这个目录【不在 cleanup_chapter_artifacts 的清理名单内】(那个名单只含
+    beat/writer/gate/reviewer/editor/archivist/context),所以无论 clean 还是
+    reports 模式都不会被删——专供人事后翻全书质量趋势。
+    红线:此文件【只写不读】,任何角色的 build_*_input 都禁止注入它,否则分数变
+    KPI、模型为分数写作、污染 reviewer 盲评——这是我们一路在防的 Goodhart 陷阱。"""
+    try:
+        SCORE_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        scores = verdict.get("scores") or {}
+        lines = [
+            f"# 第{chapter}章 评分简报",
+            "",
+            f"- 总分：{verdict.get('total', '?')}/60",
+            f"- 是否返工：{'是' if verdict.get('needs_revision') else '否'}",
+            f"- 判定来源：{verdict.get('source', '?')}（json=结构化主路 / keyword=回退）",
+            "",
+        ]
+        if scores:
+            lines.append("## 各项分数")
+            for k, v in scores.items():
+                lines.append(f"- {k}：{v}")
+            lines.append("")
+        blockers = verdict.get("blockers") or []
+        if blockers:
+            lines.append("## 阻断原因")
+            for b in blockers:
+                lines.append(f"- {b}")
+            lines.append("")
+        write_text(SCORE_REPORT_DIR / f"第{chapter:03d}章.md", "\n".join(lines))
+    except OSError as exc:
+        cli_print(f"[score_report] 第{chapter}章评分简报写入失败（不影响正文）：{exc}")
+
+
 def cleanup_chapter_artifacts(chapter: int, run_cfg: Dict[str, Any]) -> None:
     """删除后续不会被脚本读取的本章过程产物。失败章节不调用本函数，保留现场排错。"""
     mode = artifact_retention_mode(run_cfg)
@@ -2851,6 +2888,26 @@ def save_active_arcs(arcs: List[Dict[str, Any]]) -> None:
     dump_json(ACTIVE_ARCS_FILE, {"arcs": arcs})
 
 
+CLIMAX_TENSIONS = ("高", "高潮", "爆")  # arc 节点标这些 tension 即高潮节点
+
+
+def in_climax_window(chapter: int, window: int = 1) -> bool:
+    """本章是否落在某条活跃弧的『高潮节点章 ± window』窗口内。
+    高潮节点 = arc_planner 给节点标的 tension 命中 CLIMAX_TENSIONS。
+    这是『结构意图』层:arc 统筹几十章定的,不是单章自报,难通胀。
+    注意:节点章号是计划值会漂移,所以这只用来圈一个『可能要爆』的窗口,
+    真正『此刻是否爆』由 story_director 带实际正文进度实时确认(双签机制)。"""
+    for arc in load_active_arcs():
+        for n in arc.get("nodes") or []:
+            tension = str(n.get("tension") or "")
+            if not any(t in tension for t in CLIMAX_TENSIONS):
+                continue
+            node_ch = int(n.get("chapter", 0) or 0)
+            if node_ch and abs(chapter - node_ch) <= window:
+                return True
+    return False
+
+
 def needs_arc_planning(chapter: int) -> bool:
     """判断是否需要调用弧线规划师:
     - 没有活跃弧线(首次或全部收束)
@@ -3118,6 +3175,7 @@ def normalize_beat(chapter: int, beat: Dict[str, Any]) -> Dict[str, Any]:
         "情绪弧线",
         "情绪基调",
         "钩子型",
+        "关键章",
     ]:
         if key in beat:
             normalized[key] = str(beat.get(key) or "无")
@@ -4377,18 +4435,27 @@ def score_candidate(text: str, beat: Dict[str, Any], chapter: int) -> Dict[str, 
 
 def best_of_n_enabled(beat: Dict[str, Any], run_cfg: Dict[str, Any]) -> int:
     """决定本章 writer 采样几份。默认 1（关闭）。
-    仅当 run.json 开启 best_of_n 且本章是关键/高潮章（beat 标注或 run.json 配置）才 >1。
-    费 token，故默认只在关键章开启。"""
+    触发机制(用户设计,2026-06-01):
+      - beat_planner 是决策者:它每章跑、在 writer 前跑、最清楚这章是铺垫还是引爆。
+        它在 beat 里标 `关键章: true` 表示"这章该全力以赴"。
+      - arc 窗口是护栏:beat_planner 标了关键章,但只有同时落在 arc 高潮节点 ±1 章
+        窗口内才认——窗口外标了不算,防止 beat_planner 为换资源乱标(Goodhart 防护)。
+      - story_director 是建议者:它的"临近高潮"建议供 beat_planner 参考,不做门禁。
+      - run.json key_chapters 手动白名单保留作后门(特殊章节人工指定)。
+    费 token(writer×N),故默认只在关键章开启。"""
     cfg = run_cfg.get("best_of_n")
     if not cfg or not isinstance(cfg, dict) or not cfg.get("enabled"):
         return 1
     n = int(cfg.get("n") or 3)
-    # 触发条件：beat 显式标注，或本章号在 run.json 的关键章清单里
-    beat_flag = bool(beat.get("关键章") or beat.get("高潮章") or beat.get("best_of_n"))
-    key_chapters = set(int(c) for c in (cfg.get("key_chapters") or []) if str(c).isdigit())
     ch = int(beat.get("章节编号") or 0)
-    if beat_flag or ch in key_chapters:
-        return max(2, min(n, 5))   # 安全区间 2~5
+    # 路1:beat_planner 标了关键章 + 必须在 arc 高潮窗口内(护栏)
+    beat_flag = bool(beat.get("关键章") or beat.get("高潮章") or beat.get("best_of_n"))
+    if beat_flag and in_climax_window(ch):
+        return max(2, min(n, 5))
+    # 路2:run.json 手动白名单(后门,不受窗口限制——人工指定说明你知道自己在干什么)
+    key_chapters = set(int(c) for c in (cfg.get("key_chapters") or []) if str(c).isdigit())
+    if ch in key_chapters:
+        return max(2, min(n, 5))
     return 1
 
 
@@ -4716,6 +4783,7 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
             role_artifact("archivist", chapter, "archive_input.md"),
         )
     stage_done(chapter, "archivist", "更新台账", 7, total_steps, started)
+    write_score_report(chapter, verdict)  # 评分简报存 输出/分数表/(清理碰不到),只写不读
     cleanup_chapter_artifacts(chapter, run_cfg)
     cli_print(f"第 {chapter} 章完成：{manuscript_path(chapter)}")
 

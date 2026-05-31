@@ -870,10 +870,15 @@ def ledger_context_for_writer(beat: Dict[str, Any], current_chapter: int = 0) ->
         lines.append(f"  最近：第{latest.get('chapter','?')}章{latest.get('wish','')}→{latest.get('reward','')}")
 
     # —— 常驻：悬空未结清账（已结清的自动退出，所以天然有界）——
+    # 与约束账同款过滤：本章出场角色相关的债优先全留(防穿帮——别把有债的人写成陌生人/写得像已还),
+    # 其余不相关的债只取最近若干降噪。"该不该还"的决策在规划层(obligations_due_digest),不在此。
     open_obs = [o for o in (ledger.get("obligations") or []) if isinstance(o, dict) and o.get("status") != "已结"]
     if open_obs:
+        relevant_obs = [o for o in open_obs if any(name in (o.get("desc") or "") for name in cast)]
+        recent_obs = [o for o in open_obs if o not in relevant_obs][-8:]
+        show_obs = relevant_obs + recent_obs
         lines.append("\n【未结清账·悬空中（还没还的债/承诺/因果，写作时要记得它们还悬着）】")
-        for o in open_obs[-15:]:  # 同时悬空超过15条本身就是剧情问题，硬封顶
+        for o in show_obs:
             lines.append(f"- {o.get('id','')} {o.get('desc','')}（起于第{o.get('since_chapter','?')}章）")
 
     # —— 约束账：永久铁律全留 + 情境约束只留最近若干（防 append-only 无限涨）——
@@ -2447,6 +2452,31 @@ def story_director_prompt() -> str:
     )
 
 
+def obligations_due_digest(chapter: int, stale_threshold: int = 10) -> str:
+    """给规划层看的『人物债账』到期摘要(债/承诺/因果——沈安欠的、还没兑现的)。
+    与 threads(剧情线索)是两个维度:thread 问'这条线何时给读者交代',obligation 问
+    '沈安何时兑现他的良心'。代码只算 chapter - since_chapter 报到期(纯计数零语义),
+    该不该还、怎么还由规划师 LLM 判断剧情时机。软提示防 KPI 化。"""
+    ledger = load_ledger()
+    open_obs = [
+        o for o in (ledger.get("obligations") or [])
+        if isinstance(o, dict) and o.get("status") != "已结"
+    ]
+    if not open_obs:
+        return ""
+    lines = [f"【人物债账】悬空 {len(open_obs)} 笔(沈安欠的债/承诺/因果，还没兑现的)"]
+    # 挂得越久越靠前,让规划师一眼看到老债
+    for o in sorted(open_obs, key=lambda x: int(x.get("since_chapter") or chapter))[:12]:
+        gap = chapter - int(o.get("since_chapter") or chapter)
+        stale = f" ⚠已挂{gap}章" if gap >= stale_threshold else ""
+        lines.append(f"- {o.get('id','')} {o.get('desc','')}（起于第{o.get('since_chapter','?')}章）{stale}")
+    lines.append(
+        "（有合适契机可考虑了结挂得久的债，没契机继续挂着也行——还债的时机、代价、方式"
+        "比『还没还』本身更要紧。债的兑现往往是人物最重的戏，别为清账而清账。）"
+    )
+    return "\n".join(lines)
+
+
 def threads_digest_for_director(chapter: int) -> str:
     """给 story_director 看的线索/揭示台账摘要（不进 writer，避免 token 膨胀）。
     专供"有无线索休眠过久/开出去的线有无收束计划/世界观揭示是否超配额"维度判断。"""
@@ -2469,7 +2499,12 @@ def threads_digest_for_director(chapter: int) -> str:
         lines.append("\n【揭示台账】（世界观大设定揭到第几层 / 下一层计划）")
         for r in reveals[:10]:
             lines.append(f"- {r.get('topic','')}：已揭L{r.get('revealed_level',0)}，下一层计划{r.get('plan_next_level_in','') or '未定'}")
+    # 人物债账并入(与剧情线索并列两本账,让 story_director 一处看全)
+    obs_digest = obligations_due_digest(chapter)
+    if obs_digest:
+        lines.append("\n" + obs_digest)
     return "\n".join(lines).strip()
+
 
 
 def build_story_director_input(chapter: int, detected: Dict[str, Any], run_cfg: Dict[str, Any], timeout: int) -> str:
@@ -2800,6 +2835,14 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
             strand_digest,
             "normal", True,
         ))
+    # 人物债账到期:规划整条弧(几十章)时,把挂久的老债编进弧线节点了结
+    obs_due = obligations_due_digest(chapter)
+    if obs_due:
+        sections.append(make_section(
+            "人物债账·到期参考(规划弧线时,把挂久的老债安排进合适节点了结)",
+            obs_due,
+            "normal", True,
+        ))
     return compress_sections_if_needed("arc_planner", chapter, sections, run_cfg, timeout)
 
 
@@ -2924,6 +2967,12 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
     ea_text = emotional_anchors_for_planner(chapter)
     if ea_text:
         sections.append(make_section("可回响的情感锚点(草蛇灰线)", ea_text, "normal", True))
+    # 人物债账到期(债/承诺/因果):给规划层定本章有无契机了结老债。
+    # 只给规划层不给writer:writer只需知道债"还悬着"(防穿帮,已在ledger_context_for_writer),
+    # "该还了"是规划决策,塞给writer单章视角会逼它硬还=打乱节奏。
+    obs_due = obligations_due_digest(chapter)
+    if obs_due:
+        sections.append(make_section("人物债账·到期参考(本章有契机可了结哪笔债)", obs_due, "normal", True))
     threat_file = BASE_DIR / "config" / "threat_ladder.json"
     if threat_file.exists():
         threat_data = load_json(threat_file, {})

@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -575,16 +576,37 @@ def configured_extra_body(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
+
+class RequestTimeout(RuntimeError):
+    """请求总时长超过硬上限仍未返回。偶发性错误，由 call_role 重试。"""
+
+
 def http_post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+    """带总时长硬超时的 POST (daemon thread + Event.wait)。"""
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {error.code} {url}\n{detail}") from error
-
+    result_box: Dict[str, Any] = {}
+    done = threading.Event()
+    def _do_request() -> None:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result_box["ok"] = json.loads(response.read().decode("utf-8"))
+        except BaseException as exc:
+            result_box["err"] = exc
+        finally:
+            done.set()
+    hard_timeout = int(timeout * 1.5) + 30
+    worker = threading.Thread(target=_do_request, daemon=True)
+    worker.start()
+    if not done.wait(hard_timeout):
+        raise RequestTimeout(f"请求总时长超过 {hard_timeout}s 仍未返回 {url}")
+    if "err" in result_box:
+        error = result_box["err"]
+        if isinstance(error, urllib.error.HTTPError):
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {error.code} {url}\n{detail}") from error
+        raise error
+    return result_box["ok"]
 
 def extract_responses_text(data: Dict[str, Any]) -> str:
     if isinstance(data.get("output_text"), str):
@@ -731,12 +753,19 @@ def call_role(
     provider = cfg.get("name") or cfg.get("provider")
     model = cfg.get("model")
     cli_print(f"调用 {role}: provider={provider}, model={model}, input≈{estimate_tokens(input_text)} tokens")
-    # 偶发的内容风控拒绝(HTTP 200 但 content 是"request rejected")不能当正文存盘。
-    # 偶发性质:同一请求重试通常就过。连续 reject_retries 次才放弃,交由上层停在本章。
+    # 偶发故障(风控拒绝 + 请求超时)在这里重试,连续 reject_retries 次才停章。
     result = ""
     last = ""
     for attempt in range(1, reject_retries + 1):
-        result = call_model(role, instructions, input_text, role_max_output_tokens(role, default_max_tokens), timeout)
+        try:
+            result = call_model(role, instructions, input_text, role_max_output_tokens(role, default_max_tokens), timeout)
+        except RequestTimeout as exc:
+            last = str(exc)[:120]
+            cli_print(f"{role} 第 {attempt}/{reject_retries} 次请求超时：{last}")
+            if attempt < reject_retries:
+                time.sleep(min(5 * attempt, 20))
+                continue
+            raise RuntimeError(f"角色 {role} 连续 {reject_retries} 次请求超时，停在本章。") from exc
         if not is_rejection_text(result):
             break
         last = result.strip()[:80]
@@ -744,7 +773,7 @@ def call_role(
         if attempt < reject_retries:
             time.sleep(min(5 * attempt, 20))
     else:
-        raise RuntimeError(f"角色 {role} 连续 {reject_retries} 次被内容风控拒绝（非偶发），停在本章。最后返回：{last}")
+        raise RuntimeError(f"角色 {role} 连续 {reject_retries} 次被内容风控拒绝，停在本章。")
     write_text(output_path, result)
     return result
 
@@ -923,7 +952,7 @@ def ledger_context_for_writer(beat: Dict[str, Any], current_chapter: int = 0) ->
         cons_str = "、".join(f"{c['name']}×{c['qty']}" for c in consumables[:8])
         inv_lines.append(f"消耗品：{cons_str}")
     if inv_lines:
-        lines.append("【物品清单（必须与正文一致，禁止使用未持有物品/未习得技能）】")
+        lines.append("【物品清单（硬事实——正文提到数量时必须与此一致，不可凭感觉改数字）】")
         lines.extend(inv_lines)
 
     # —— 愿录摘要 ——
@@ -971,7 +1000,16 @@ def ledger_context_for_writer(beat: Dict[str, Any], current_chapter: int = 0) ->
         in_scene = name in cast or (e.get("type") in ("地点", "势力", "物件") and name in beat_text)
         if in_scene:
             voice = f"\n  声音：{e['voice']}" if e.get("voice") else ""
-            facts = "".join(f"\n  - {f}" for f in (e.get("facts") or [])[:6])
+            # 过滤 facts 中提到已消耗物品的旧条目（防止 qty=0 的东西通过 facts 泄露给 writer）
+            depleted_items = set()
+            for cat in ("consumables", "key_items"):
+                for item in (inventory.get(cat) or []):
+                    if (isinstance(item, dict) and (item.get("qty") == 0 or item.get("status") in ("已销毁", "已丢失"))):
+                        depleted_items.add(item.get("name", ""))
+            raw_facts = (e.get("facts") or [])[:6]
+            if depleted_items:
+                raw_facts = [f for f in raw_facts if not any(d in f for d in depleted_items if d)]
+            facts = "".join(f"\n  - {f}" for f in raw_facts)
             realm = f"\n  境界：{e['realm']}" if e.get("realm") else ""
             skills = ""
             if e.get("skills"):
@@ -1709,20 +1747,11 @@ def emotional_distribution_warnings(chapter: int, lookback: int = 10) -> str:
 
 
 def chapter_satisfaction_check(text: str, beat: Dict[str, Any]) -> List[str]:
-    """Post-write check: did chapter deliver on beat promises?"""
+    """正文客观下限检查。转折/承诺落地是创作判断，属 reviewer 职责。"""
     issues = []
-    # Check minimum word count
     chinese_chars = len(re.findall(r'[一-鿿]', text))
     if chinese_chars < 1800:
-        issues.append(f"正文过短（{chinese_chars}字），目标2500-3500字")
-    # Check if beat's 转折 keywords appear
-    turning = beat.get("转折", "")
-    if turning and chinese_chars > 1500:
-        key_words = [w for w in re.findall(r'[一-鿿]{2,4}', turning) if len(w) >= 2]
-        if key_words:
-            found = sum(1 for w in key_words if w in text)
-            if found < max(1, len(key_words) * 0.2):
-                issues.append(f"beat规划的转折「{turning[:30]}」在正文中几乎未体现")
+        issues.append(f"正文过短（{chinese_chars}字），疑似被截断")
     return issues
 
 
@@ -1786,13 +1815,14 @@ def writer_focus_modules(beat: Dict[str, Any]) -> str:
         if path.exists():
             selected.append(read_text(path).strip())
 
-    # 对话:场景类型含对话/日常,或 beat 里有潜台词机会
-    has_dialogue = any(k in scene for k in ["对话", "日常", "审", "问"]) or "潜台词" in beat_blob
+    # 对话:场景类型含对话/日常,或 beat 里有潜台词机会(值不为"无")
+    qtc = str(beat.get("潜台词机会") or "")
+    qtc_active = bool(qtc) and not qtc.startswith("无")
+    has_dialogue = any(k in scene for k in ["对话", "日常", "审", "问"]) or qtc_active
     if has_dialogue:
         add("对话")
     # 潜台词:仅当 beat 明确标注且不为"无"
-    qtc = str(beat.get("潜台词机会") or "")
-    if qtc and qtc not in ("无", "", "None"):
+    if qtc_active:
         add("潜台词")
     # 黑子:出场才注入
     if "黑子" in cast or "黑子" in beat_blob:
@@ -1803,8 +1833,10 @@ def writer_focus_modules(beat: Dict[str, Any]) -> str:
     add("盲感官")
     # 深度模块:仅当 beat 标注对应字段且不为"无"
     def field_active(key: str) -> bool:
-        v = str(beat.get(key) or "")
-        return bool(v) and v not in ("无", "", "None", "积累中，未触发", "积累中,未触发")
+        v = str(beat.get(key) or "").strip()
+        if not v or v.startswith("无") or v in ("None", "积累中，未触发", "积累中,未触发"):
+            return False
+        return True
     if field_active("情绪裂缝"):
         add("情绪裂缝")
     if field_active("内在转变"):
@@ -2139,6 +2171,20 @@ def hard_gate(text: str) -> Dict[str, Any]:
             issues.append(f"疑似源文专名污染: {word}")
     if re.search(r"LF-\d{3}", text):
         issues.append("正文泄露长线伏笔内部编号 LF-XXX。")
+    if re.search(r"第\d+章", text):
+        issues.append("正文泄露元信息：出现'第X章'系统编号。角色回忆应用'上回/那天/之前'。")
+    meta_leaks = ["beat", "台账", "角色卡", "卷纲", "弧线规划", "伏笔编号", "F-0"]
+    for leak in meta_leaks:
+        if leak in text:
+            issues.append(f"正文泄露系统元信息: '{leak}'")
+            break
+    # "不是A是B"句式检测：只检测引号外的叙述部分（对话里角色说"不是"是合理的）
+    narrative_parts = re.sub(r'"[^"]*"', '', text)
+    not_a_is_b = re.findall(r'不是[^，。！？"\n]{1,20}[，—]+\s*是[^。！？"\n]{1,20}', narrative_parts)
+    if len(not_a_is_b) >= 2:
+        issues.append(f"AI腔'不是A是B'句式在叙述中出现{len(not_a_is_b)}次（已全禁）：{'｜'.join(s[:15] for s in not_a_is_b[:3])}")
+    elif len(not_a_is_b) == 1:
+        warnings.append(f"AI腔'不是A是B'句式出现1次：{not_a_is_b[0][:20]}")
     for group in [["沈安", "沈归舟"], ["黑子", "阿墨"], ["方绾", "方青瓷"]]:
         found = [name for name in group if name in text]
         if len(found) > 1:
@@ -2151,16 +2197,8 @@ def hard_gate(text: str) -> Dict[str, Any]:
             else:
                 issues.append(f"疑似照抄角色伪例: {example}")
     paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
-    long_paragraphs = [p for p in paragraphs if len(p) > 60]
-    if len(long_paragraphs) > max(3, len(paragraphs) * 0.15):
-        issues.append("长段落偏多，可能不符合短段落风格。")
+    # 长段落/长句/正文偏长 已去牙(style_gate metrics 有中性数字给 reviewer)。
     sentences = [s.strip() for s in re.split(r"[。！？!?\n]+", text) if s.strip()]
-    long_sentences = [s for s in sentences if len(s) > 35]
-    if len(long_sentences) > max(5, len(sentences) * 0.2):
-        issues.append("长句偏多，建议压短。")
-    chinese_count = len(re.findall(r"[\u4e00-\u9fff]", text))
-    if chinese_count > 4200:
-        issues.append("正文偏长，可能为了字数填充。")
     for phrase in filler_phrases:
         if text.count(phrase) >= 1:
             issues.append(f"疑似注水/AI泛化表达: {phrase}")
@@ -2184,16 +2222,16 @@ def hard_gate(text: str) -> Dict[str, Any]:
         warnings.append(f"章末钩子疑似用廉价悬念词收尾（{'/'.join(hook_hits)}）；源文风格靠短句和留白，建议改。")
     # 视觉穿帮：只卡两种真突兀——白天强光场景的精细视觉、装瞎场景却写主角看清
     vision_issues = check_vision_consistency(text)
-    issues.extend(vision_issues)
+    warnings.extend(vision_issues)
     short_sentences = [s for s in sentences if len(s) <= 10]
     if sentences and len(short_sentences) / len(sentences) < 0.25:
-        issues.append("超短句比例偏低，文字可能被修得太平滑。")
+        warnings.append("超短句比例偏低，文字可能被修得太平滑。")
     sentence_lengths = [len(s) for s in sentences]
     if len(sentence_lengths) >= 20:
         avg = sum(sentence_lengths) / len(sentence_lengths)
         variance = sum((length - avg) ** 2 for length in sentence_lengths) / len(sentence_lengths)
         if variance < 35:
-            issues.append("句长方差偏低，疑似过度工整。")
+            warnings.append("句长方差偏低，疑似过度工整。")
     return {"passed": not issues, "issues": issues, "warnings": warnings}
 
 
@@ -2228,32 +2266,8 @@ def style_gate(text: str) -> Dict[str, Any]:
         ),
         "breath_count": len(re.findall(r"\d+息", text)),
     }
-    if metrics["repetitive_action_count"] > 3:
-        issues.append(f"签名动作重复过多（竹杖点地等出现{metrics['repetitive_action_count']}次）,换其他感官细节。")
-    if metrics["ear_flat_count"] > 3:
-        issues.append(f"黑子耳朵压平/压着出现{metrics['ear_flat_count']}次,一章最多2次。")
-    if metrics["nose_action_count"] > 3:
-        issues.append(f"黑子鼻子拱/蹭/抽出现{metrics['nose_action_count']}次,一章最多2次。")
-    if metrics["silence_count"] > 5:
-        issues.append(f"「没说话/没动/没接话」出现{metrics['silence_count']}次,沉默表达一次够了。")
-    if metrics["mc_subject_start_ratio"] > 0.25:
-        issues.append(f"「沈安」开头的句子占{metrics['mc_subject_start_ratio']*100:.0f}%,主语开头太单一,用动作/环境/对话开头替代。")
-    if metrics["breath_count"] > 4:
-        issues.append(f"「X息」计时出现{metrics['breath_count']}次,换其他时间表达(一会儿/片刻/半盏茶)。")
-    if metrics["avg_paragraph_length"] > 35:
-        issues.append("平均段落偏长。")
-    if metrics["long_paragraph_ratio"] > 0.12:
-        issues.append("长段落比例偏高。")
-    if metrics["long_sentence_ratio"] > 0.18:
-        issues.append("长句比例偏高。")
-    if metrics["short_sentence_ratio"] < 0.25:
-        issues.append("短句比例偏低。")
-    if metrics["hedge_count"] > 4:
-        issues.append("仿佛/似乎/好像频率偏高。")
     if metrics["emotion_summary_count"] > 0:
         issues.append("出现情绪总结词。")
-    if metrics["said_count"] > max(4, len(sentences) * 0.08):
-        issues.append("说道类标识密度偏高。")
     return {"passed": not issues, "issues": issues, "metrics": metrics}
 
 
@@ -2321,6 +2335,29 @@ def extract_character_mentions(text: str) -> set:
     return {name for name in names if name and name in text}
 
 
+def cast_checklist_for_reviewer(text: str) -> str:
+    """从 ledger 提取正文中出现的角色/实体的核实清单,供 reviewer 校验一致性。
+    每条只含:名字、类型/物种、voice、关键标识。极精简,通常 < 200 tokens。"""
+    ledger = load_ledger()
+    entities = ledger.get("entities") or {}
+    mentioned = extract_character_mentions(text)
+    lines = []
+    for name in sorted(mentioned):
+        e = entities.get(name)
+        if not e or not isinstance(e, dict):
+            continue
+        etype = e.get("type", "?")
+        summary_short = (e.get("summary") or "")[:40]
+        voice = e.get("voice") or ""
+        parts = [f"[{etype}] {name}：{summary_short}"]
+        if voice:
+            parts.append(f"  语言：{voice[:60]}")
+        lines.append("\n".join(parts))
+    if not lines:
+        return ""
+    return "以下是本章出场角色/实体的台账信息,请核对正文是否与之矛盾（名称、物种、身份、语言特征等）：\n" + "\n".join(lines)
+
+
 def combine_checks(checks: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     issues: List[str] = []
     warnings: List[str] = []
@@ -2348,11 +2385,10 @@ def make_review_input(
     timeout: int,
     diagnostics: Optional[Dict[str, Any]] = None,
 ) -> str:
+    checklist = cast_checklist_for_reviewer(text)
     sections = [
         make_section("故事总监批注", story_director_context(chapter), "critical", False),
         make_section("风格指南", read_text(BASE_DIR / "01-风格指南.md"), "critical", False),
-        # 注:旧的 06-验证打分表.md(7项/30)曾在此注入,但 reviewer.md 系统提示本身已含完整
-        # 12项/60 rubric,两者数字打架且冗余。#6 统一为单一权威(reviewer.md),此处不再注入打分表。
         make_section("AI腔黑名单", read_text(BASE_DIR / "12-AI腔黑名单.md"), "critical", False),
         make_section(
             "脚本硬检查结果",
@@ -2360,8 +2396,10 @@ def make_review_input(
             "high",
             False,
         ),
+        make_section("出场角色核实清单", checklist, "high", False) if checklist else None,
         make_section("待评审正文", text, "high", True),
     ]
+    sections = [s for s in sections if s]
     return compress_sections_if_needed("reviewer", chapter, sections, run_cfg, timeout)
 
 
@@ -2456,14 +2494,19 @@ def previous_final_excerpt(chapter: int, max_chars: int = 3500) -> str:
 # ========================= 故事总监 / 类型纠偏 =========================
 # 只管方向,不写正文:检测短线是否偏离卷纲主类型,给 arc_planner/beat_planner 硬约束。
 
-def recent_text_blob(chapter: int, lookback: int = 3, max_chars_per_chapter: int = 2200) -> str:
-    parts: List[str] = []
-    for ch in range(max(1, chapter - lookback), chapter):
-        path = manuscript_path(ch)
-        if path.exists():
-            text = read_text(path)
-            parts.append(f"第{ch}章摘录:\n{text[-max_chars_per_chapter:]}")
-    return "\n\n".join(parts)
+def recent_text_blob(chapter: int, lookback: int = 5, max_chars_per_chapter: int = 2200) -> str:
+    """给 story_director 的最近章节摘要：用 state.json 的 recent_events + beat 标题，
+    不注入原文。每章一行重点，总量极小。"""
+    state = load_state()
+    events = state.get("recent_events") or []
+    # recent_events 是最近30条，取最近 lookback*3 条（每章约2-3条事件）
+    relevant = events[-(lookback * 3):]
+    if not relevant:
+        return "(暂无近期事件记录)"
+    lines = []
+    for i, ev in enumerate(relevant):
+        lines.append(f"- {ev}")
+    return "最近发生的事（按时间顺序）：\n" + "\n".join(lines)
 
 
 def extract_volume_stage_for_chapter(volume_text: str, chapter: int) -> str:
@@ -2625,6 +2668,34 @@ def threads_digest_for_director(chapter: int) -> str:
 
 
 
+def _outline_digest_for_director() -> str:
+    """从全书骨架 JSON 里只提取 story_director 需要的全局定位信息,
+    从 13000+ token 压到几百 token。卷纲已给当前卷详细规划,骨架只补全局视野。"""
+    raw = read_text(MASTER_OUTLINE_FILE)
+    if not raw.strip():
+        return "（全书骨架尚未生成）"
+    try:
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return raw[:800] + "\n...(骨架过长已截断)"
+    parts = []
+    if data.get("core_arc"):
+        parts.append(f"全书主线弧线：{data['core_arc']}")
+    if data.get("ending"):
+        parts.append(f"结局走向：{str(data['ending'])[:200]}")
+    evol = data.get("world_evolution") or []
+    if evol:
+        parts.append("世界演变阶段：")
+        for stage in evol:
+            vols = stage.get("volumes", [])
+            parts.append(f"  卷{'/'.join(str(v) for v in vols)}：{stage.get('summary','')}")
+    return "\n".join(parts)
+
+
 def build_story_director_input(chapter: int, detected: Dict[str, Any], run_cfg: Dict[str, Any], timeout: int) -> str:
     previous = load_story_director()
     prev_note = ""
@@ -2635,11 +2706,15 @@ def build_story_director_input(chapter: int, detected: Dict[str, Any], run_cfg: 
             f"曾点名的重复模式:{previous.get('watch_repetition') or '无'}。"
             "如果上次的问题已经改善,就别再揪着不放;如果依然存在,可以升级严重度。"
         )
+    # 全书骨架摘要:story_director 只需要全书主线定位 + 当前卷在全书中的位置,
+    # 不需要 800 章的逐卷详细规划(那是 13000+ token,占满预算挤掉正文摘录和 beat 摘要)。
+    # 卷纲已经给了当前卷的详细规划,骨架只补"全局视野"。
+    outline_digest = _outline_digest_for_director()
     sections = [
         make_section("当前章节", f"第{chapter}章", "critical", False),
-        make_section("任务", "请自由审核当前故事方向。不要依赖关键词打分,按卷纲兑现度、核心叙事模式(治心病)、推进vs打转、重复模式、节奏冷热五个维度判断。默认放行,只在反复出现明确问题时纠偏。", "critical", False),
-        make_section("故事核(注意核心叙事模式:治心病)", read_text(BASE_DIR / "09-故事核.md"), "critical", False),
-        make_section("全书骨架", read_text(MASTER_OUTLINE_FILE), "critical", True),
+        make_section("任务", "请自由审核当前故事方向。不要依赖关键词打分,按卷纲兑现度、核心叙事模式(以故事核为准)、推进vs打转、重复模式、节奏冷热五个维度判断。默认放行,只在反复出现明确问题时纠偏。", "critical", False),
+        make_section("故事核", read_text(BASE_DIR / "09-故事核.md"), "critical", False),
+        make_section("全书骨架摘要(全局定位,详细规划见卷纲)", outline_digest, "high", True),
         make_section("卷纲", read_text(VOLUME_PLAN_FILE), "critical", False),
         make_section("当前活跃弧线", json.dumps(load_active_arcs(), ensure_ascii=False, indent=2), "high", True),
         make_section("期待账本", read_text(BASE_DIR / "08-期待账本.md"), "high", True),
@@ -2828,14 +2903,122 @@ def needs_volume_planning(chapter: int) -> bool:
     return chapter >= end - 5
 
 
+def long_foreshadowing_progress(chapter: int) -> str:
+    """长线伏笔进度表:从 reveal_ledger + 长线伏笔资产库自动生成,
+    告诉卷纲/弧线规划师每条长线伏笔当前揭到第几层、该不该在本卷推进。
+    每条一行,几百 token,不爆预算。"""
+    ledger = load_json(RUNTIME_DIR / "ledger.json", {})
+    reveals = ledger.get("reveal_ledger") or []
+    if not reveals:
+        return ""
+    lines = ["长线伏笔进度表（规划时参考,决定本卷/本弧该推进哪几条）:\n"]
+    lines.append("| 主题 | 已揭层级 | 上次外显章 | 计划下次揭示 | 本卷建议 |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for r in reveals:
+        topic = r.get("topic", "?")
+        level = r.get("revealed_level", 0)
+        last_ch = r.get("last_reveal_chapter", "?")
+        plan_next = r.get("plan_next_level_in", "未定")
+        # 判断"本卷建议":如果 plan_next 包含当前卷的关键词,标"该推进"
+        suggestion = "按计划推进" if any(k in str(plan_next) for k in ["本卷", "第一卷", "第二卷"]) else "不急/按骨架节奏"
+        # 如果距上次外显超过 30 章,提醒别忘了
+        gap = chapter - int(last_ch) if isinstance(last_ch, int) else 0
+        if gap > 30:
+            suggestion = f"⚠已{gap}章未外显,考虑推进"
+        lines.append(f"| {topic} | 第{level}层 | 第{last_ch}章 | {plan_next} | {suggestion} |")
+    lines.append("\n注:「该推进」不是必须本章就做,而是本卷内找合适时机安排。规划时在阶段表/弧线节点里标注即可。")
+    return "\n".join(lines)
+
+
+VOLUME_DIGESTS_FILE = RUNTIME_DIR / "volume_summaries.json"
+
+
 def volume_summary(chapter: int) -> str:
-    """压缩'上一卷/已写内容'的摘要给卷纲规划师看。
-    从台账日志里取最近的更新,不是原文。"""
-    log = read_text(BASE_DIR / "07-动态状态台账.md")
-    # 取最后 3000 字符(最近的章节更新)
-    if len(log) > 3000:
-        log = log[-3000:]
-    return log
+    """给卷纲规划师的发展历程:全书卷摘要(远期) + 上一卷详细弧线(近期)。"""
+    parts = []
+    digests = load_json(VOLUME_DIGESTS_FILE, {"volumes": []})
+    if digests.get("volumes"):
+        parts.append("## 全书发展历程")
+        for i, vol in enumerate(digests["volumes"], 1):
+            ch = vol.get("volume_end_chapter", "?")
+            parts.append(f"### 第{i}卷(截至第{ch}章)")
+            parts.append(vol.get("digest", "(无摘要)"))
+            parts.append("")
+    arc_history_file = RUNTIME_DIR / "arc_history.json"
+    if arc_history_file.exists():
+        history = load_json(arc_history_file, {"volumes": []})
+        volumes = history.get("volumes") or []
+        if volumes:
+            last_vol = volumes[-1]
+            arcs = last_vol.get("arcs") or []
+            if arcs:
+                arc_lines = [f"## 上一卷弧线详情({len(arcs)}条)"]
+                for arc in arcs:
+                    arc_lines.append(f"**{arc.get('title','?')}**: {arc.get('summary','')[:120]}")
+                    arc_lines.append(f"  收束条件: {arc.get('resolution_condition','')}")
+                    for node in (arc.get("nodes") or []):
+                        arc_lines.append(f"  第{node.get('chapter','?')}章[{node.get('tension','?')}]: {node.get('beat_hint','')[:60]}")
+                    arc_lines.append("")
+                parts.append("\n".join(arc_lines))
+    if VERSION_DIR.exists():
+        backups = sorted(VERSION_DIR.glob("卷纲_截至第*章.md"), key=lambda p: p.stat().st_mtime)
+        if backups:
+            old_plan = read_text(backups[-1])
+            if old_plan.strip():
+                parts.append(f"## 上一卷卷纲\n\n{old_plan[:2000]}")
+    if not parts:
+        return "(首卷,无历史回顾)"
+    return "\n\n".join(parts)
+
+
+def _generate_volume_digest(chapter: int, old_arcs: List[Dict[str, Any]]) -> None:
+    """卷纲切换时调 compressor 生成本卷发展摘要。"""
+    outline_digest = _outline_digest_for_director()
+    old_plan = ""
+    if VERSION_DIR.exists():
+        backups = sorted(VERSION_DIR.glob("卷纲_截至第*章.md"), key=lambda p: p.stat().st_mtime)
+        if backups:
+            old_plan = read_text(backups[-1])[:2000]
+    arc_text = ""
+    if old_arcs:
+        arc_lines = []
+        for a in old_arcs:
+            arc_lines.append(f"{a.get('title','?')}: {a.get('summary','')[:100]}")
+            for n in (a.get("nodes") or []):
+                arc_lines.append(f"  第{n.get('chapter','?')}章: {n.get('beat_hint','')[:60]}")
+        arc_text = "\n".join(arc_lines)
+    char_arcs = ""
+    arcs_file = RUNTIME_DIR / "character_arcs.md"
+    if arcs_file.exists():
+        char_arcs = read_text(arcs_file)[-1500:]
+    input_parts = []
+    if outline_digest:
+        input_parts.append(f"## 全书方向\n{outline_digest[:500]}")
+    if old_plan:
+        input_parts.append(f"## 本卷卷纲\n{old_plan}")
+    if arc_text:
+        input_parts.append(f"## 本卷弧线\n{arc_text}")
+    if char_arcs:
+        input_parts.append(f"## 角色内在变化\n{char_arcs}")
+    input_text = "\n\n".join(input_parts)
+    prompt = (
+        "你是摘要员。为刚结束的这一卷生成发展摘要,供下一卷规划师参考。\n"
+        "要求:只记关键转折/不可逆变化/第一次;对照全书方向标注本卷推进到哪一步;\n"
+        "角色只记内在转变;关系只记质变;标注必须接住的尾巴。200-300字。\n"
+        "格式:卷结束章/本卷位置/关键转折/角色变化/关系质变/世界状态/必须接住的尾巴"
+    )
+    try:
+        result = call_role(
+            "compressor", prompt, input_text,
+            RUNTIME_DIR / "volume_digest_raw.md", 240, 1000,
+        )
+    except Exception as exc:
+        cli_print(f"[volume_digest] 摘要生成失败({exc})")
+        result = f"卷结束章:第{chapter}章\n(摘要生成失败)"
+    summaries = load_json(VOLUME_DIGESTS_FILE, {"volumes": []})
+    summaries["volumes"].append({"volume_end_chapter": chapter, "digest": result.strip()})
+    dump_json(VOLUME_DIGESTS_FILE, summaries)
+    cli_print("[volume_planner] 本卷发展摘要已生成")
 
 
 def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None:
@@ -2853,7 +3036,8 @@ def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> N
         make_section("结构化当前状态", structured_state_text(), "high", True),
         make_section("期待账本(未回收伏笔)", read_text(BASE_DIR / "08-期待账本.md"), "high", True),
         make_section("长线伏笔资产库", read_text(LONG_FORESHADOWING_FILE), "high", True),
-        make_section("上卷/已写内容回顾", volume_summary(chapter), "normal", True),
+        make_section("长线伏笔进度表(本卷该推进哪几条)", long_foreshadowing_progress(chapter), "critical", False),
+        make_section("上卷结构化回顾(承上启下的关键依据)", volume_summary(chapter), "high", False),
     ]
     input_text = render_sections(sections)
     if run_cfg.get("dry_run"):
@@ -2869,9 +3053,30 @@ def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> N
         write_text(backup, old)
         cli_print(f"[volume_planner] 旧卷纲已备份 → {backup}")
     write_text(VOLUME_PLAN_FILE, result)
-    # 弧线也要清空,让 arc_planner 在新卷纲下重新规划
-    save_active_arcs([])
-    cli_print("[volume_planner] 新卷纲已生成,活跃弧线已清空(arc_planner 会重新规划)。")
+    # === 生成本卷发展摘要(纯代码从结构化数据提取,不调 API) ===
+    _generate_volume_digest(chapter, old_arcs)
+    # 弧线存档:清空前把完整弧线数据追加到历史文件,供下次卷纲规划时回顾"上一卷实际走了什么"
+    old_arcs = load_active_arcs()
+    if old_arcs:
+        arc_history_file = RUNTIME_DIR / "arc_history.json"
+        history = load_json(arc_history_file, {"volumes": []})
+        history["volumes"].append({
+            "archived_at_chapter": chapter,
+            "arcs": old_arcs,
+        })
+        dump_json(arc_history_file, history)
+        cli_print(f"[volume_planner] 上一卷弧线已存档({len(old_arcs)}条) → arc_history.json")
+    # 未收束的弧线(最后节点 > 当前章)保留到新卷,标记跨卷延续
+    continuing = [a for a in old_arcs if a.get("nodes") and
+                  max(int(n.get("chapter", 0) or 0) for n in a["nodes"]) > chapter]
+    if continuing:
+        for a in continuing:
+            a["cross_volume"] = True
+        save_active_arcs(continuing)
+        cli_print(f"[volume_planner] {len(continuing)}条未收束弧线保留跨卷延续。")
+    else:
+        save_active_arcs([])
+    cli_print("[volume_planner] 新卷纲已生成,arc_planner 会在需要时规划新弧线。")
 
 
 # ========================= 弧线规划师(Arc Planner) =========================
@@ -2959,10 +3164,11 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
         make_section("故事总监批注(方向参考，保持自然阅读感)", story_director_context(chapter), "critical", False),
         make_section("上一批弧线收束摘要(承上启下)", previous_arcs_summary(), "high", False),
         make_section("故事核", read_text(BASE_DIR / "09-故事核.md"), "critical", False),
-        make_section("卷纲(你的弧线必须在卷纲的当前阶段内)", read_text(BASE_DIR / "卷纲" / "10-卷纲.md"), "high", True),
+        make_section("【硬约束】卷纲(弧线必须在此框架内,不可违背事件顺序和结局)", read_text(BASE_DIR / "卷纲" / "10-卷纲.md"), "critical", False),
         make_section("结构化当前状态", structured_state_text(), "high", True),
         make_section("正典账本快照", read_text(LEDGER_MD_FILE, "暂无。"), "high", True),
         make_section("期待账本(未回收伏笔)", read_text(BASE_DIR / "08-期待账本.md"), "normal", True),
+        make_section("长线伏笔进度表(本弧该顺手推进哪几条)", long_foreshadowing_progress(chapter), "high", False),
         make_section("最近章节 beat 回顾", recent_beats_summary(chapter), "normal", True),
     ]
     # 三线配比给中期规划师:规划这一弧(几十章)时,决定该弧要补情义/天地,平衡道途独大
@@ -3062,6 +3268,10 @@ def active_arcs_for_beat(chapter: int) -> str:
         for n in relevant[:4]:
             marker = "→" if int(n.get("chapter", 0) or 0) == chapter else " "
             lines.append(f"  {marker} 第{n.get('chapter', '?')}章 [{n.get('tension', '?')}] {n.get('beat_hint', '')}")
+        # 伏笔操作:告诉 beat_planner 本弧线规划了哪些伏笔动作,它该在合适时机安排
+        fops = arc.get("foreshadowing_ops") or []
+        if fops:
+            lines.append(f"伏笔操作(本弧线规划的,找合适章节安排):{'; '.join(str(f) for f in fops)}")
     return "\n".join(lines)
 
 
@@ -3073,7 +3283,7 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
         make_section("世界观设定圣经", read_text(BASE_DIR / "02-世界观设定圣经.md"), "critical", False),
         make_section("修炼境界安全参考", safe_cultivation_for_writer(), "high", True),
         make_section("卷纲", read_text(BASE_DIR / "卷纲" / "10-卷纲.md"), "high", True),
-        make_section("长线伏笔资产库", long_foreshadowing_text(chapter, writer_safe=False), "critical", True),
+        make_section("长线伏笔安全提醒(不含真相,只看表层线索)", long_foreshadowing_text(chapter, writer_safe=True), "high", True),
         make_section("结构化当前状态", structured_state_text(), "high", True),
         make_section("最近台账日志摘录", recent_ledger_tail(), "low", True),
         make_section("正典账本快照", read_text(LEDGER_MD_FILE, "暂无正典账本。"), "high", True),
@@ -3081,7 +3291,7 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
     ]
     arc_text = active_arcs_for_beat(chapter)
     if arc_text:
-        sections.insert(4, make_section("当前活跃弧线(短线剧情骨架)", arc_text, "high", False))
+        sections.insert(1, make_section("【硬约束】当前弧线走向(必须遵循,不可自行另起剧情)", arc_text, "critical", False))
     # 节奏/情绪警告 + 威胁阶梯
     pacing_warn = pacing_variety_warnings(chapter)
     if pacing_warn:
@@ -3351,6 +3561,27 @@ def merge_state_update(update: Dict[str, Any]) -> None:
         existing = threads.setdefault("open_questions", [])
         existing.extend(str(item) for item in open_questions)
         threads["open_questions"] = existing[-30:]
+    # long_foreshadowing_touches: 长线伏笔本章触碰记录 → 追加到 reveal_ledger 对应条目
+    lf_touches = update.get("long_foreshadowing_touches")
+    if isinstance(lf_touches, list) and lf_touches:
+        ledger = load_ledger()
+        reveals = ledger.setdefault("reveal_ledger", [])
+        by_id = {r.get("id") or r.get("topic"): r for r in reveals if isinstance(r, dict)}
+        for touch in lf_touches:
+            if not isinstance(touch, dict):
+                continue
+            lf_id = touch.get("id") or ""
+            node = by_id.get(lf_id)
+            if not node:
+                continue
+            touches_list = node.setdefault("touches", [])
+            touches_list.append({
+                "chapter": touch.get("chapter") or update.get("_chapter"),
+                "touch": touch.get("touch", ""),
+                "new_information": touch.get("new_information", ""),
+            })
+            node["touches"] = touches_list[-10:]
+        dump_json(LEDGER_FILE, ledger)
     # 三线节奏:archivist 打的 dominant_strand 标签 → 更新计数器(归一化后)
     dominant_raw = update.get("dominant_strand")
     chapter_no = update.get("_chapter")
@@ -3432,6 +3663,15 @@ def merge_ledger_update(update: Dict[str, Any], chapter: int) -> None:
             cur["voice"] = upd["voice"]
         if upd.get("realm_change"):
             cur["realm"] = upd["realm_change"]
+        if upd.get("skills_remove"):
+            remove_names = set()
+            for sk in upd["skills_remove"]:
+                if isinstance(sk, str):
+                    remove_names.add(sk)
+                elif isinstance(sk, dict) and sk.get("name"):
+                    remove_names.add(sk["name"])
+            if remove_names:
+                cur["skills"] = [s for s in (cur.get("skills") or []) if not (isinstance(s, dict) and s.get("name") in remove_names)]
         if upd.get("skills_add"):
             existing = {s.get("name") for s in (cur.get("skills") or []) if isinstance(s, dict)}
             for sk in upd["skills_add"]:
@@ -4645,9 +4885,13 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
             original_len = len(re.findall(r'[一-鿿]', final))
             # 第1轮:查全文穿帮
             fact_check_result = run_fact_checker(final, beat, chapter, run_cfg, timeout)
-            real_issues = len(re.findall(r"^\d+\.\s*\[", fact_check_result, re.MULTILINE)) if fact_check_result else 0
+            # 只数"穿帮问题"section里的条目,忽略"疑似问题"
+            real_issues = 0
+            if fact_check_result:
+                breach_section = re.split(r"###\s*疑似", fact_check_result, maxsplit=1)[0]
+                real_issues = len(re.findall(r"^\d+\.\s*\[", breach_section, re.MULTILINE))
             if real_issues > 0:
-                issue_lines = re.findall(r"^\d+\.\s*\[.*", fact_check_result, re.MULTILINE)
+                issue_lines = re.findall(r"^\d+\.\s*\[.*", breach_section, re.MULTILINE)
                 cli_print(f"第 {chapter} 章事实核查第1轮:{real_issues} 处穿帮,点对点修改…")
                 for il in issue_lines[:5]:
                     cli_print(f"  穿帮: {il[:80]}")
@@ -4734,9 +4978,14 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
             stage_done(chapter, "fact_checker", "事实核查", 6, total_steps, started)
 
     # 清洗:mimo 有时会把思考过程吐到正文前面,只保留 "# 第X章" 开始的内容
-    chapter_heading = re.search(r"^#\s*第\d+章", final, re.MULTILINE)
+    # 也匹配模型原样复制模板占位符的情况 (# 第{N}章)
+    chapter_heading = re.search(r"^#\s*第(?:\d+|\{N\})章", final, re.MULTILINE)
     if chapter_heading:
         final = final[chapter_heading.start():]
+    # 强制修正标题行：模型可能输出模板占位符或漏掉标题
+    title = beat.get("标题") or ""
+    correct_heading = f"# 第{chapter}章 {title}".rstrip()
+    final = re.sub(r"^#\s*第(?:\d+|\{N\})章[^\n]*", correct_heading, final, count=1, flags=re.MULTILINE)
 
     write_text(role_artifact("writer", chapter, "final.md"), final)
     write_text(manuscript_path(chapter), final)

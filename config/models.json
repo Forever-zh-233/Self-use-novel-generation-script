@@ -37,6 +37,15 @@
         },
         "stream": false
       }
+    },
+    "deepseek": {
+      "说明": "deepseek-v4-pro，用于写手角色。",
+      "type": "openai_chat",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "extra_body": {
+        "stream": false
+      }
     }
   },
   "roles": {
@@ -93,7 +102,7 @@
     "archivist": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
-      "max_output_tokens": 20000
+      "max_output_tokens": 8000
     },
     "compressor": {
       "provider": "mimo_main",

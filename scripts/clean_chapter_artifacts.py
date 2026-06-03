@@ -55,6 +55,9 @@ for sub in output_subdirs:
 # === beats/ ===
 rm_contents(BASE / "beats", "beats")
 
+# === 卷纲（由 volume_planner 生成，重跑会重新生成） ===
+rm_file(BASE / "卷纲" / "10-卷纲.md", "卷纲/10-卷纲.md")
+
 # === 台账版本/ ===
 rm_contents(BASE / "台账版本", "台账版本")
 
@@ -69,8 +72,11 @@ runtime_files = [
     "story_director.json", "story_director.md",
     "story_director_input.md", "story_director_raw.md",
     "progress.json",
-    "arc_planner_output.md",
-    "volume_summaries.json",
+    "arc_planner_output.md", "arc_planner_dryrun.md",
+    "volume_summary.md", "volume_summaries.json",
+    "volume_planner_output.md", "volume_planner_dryrun.md",
+    "volume_digest_raw.md",
+    "master_outline_raw.md", "master_outline_dryrun.md",
     "arc_history.json",
 ]
 for name in runtime_files:
@@ -80,7 +86,7 @@ for name in runtime_files:
 rm_contents(RUNTIME / "analyst", "  runtime/analyst")
 
 # 锁和停止文件（残留的）
-for lock in ["novel_pipeline.lock", "novel_pipeline.bat.lock", "stop.request"]:
+for lock in ["novel_pipeline.lock", "novel_pipeline.bat.lock", "stop.request", "pause.request"]:
     rm_file(RUNTIME / lock, f"    {lock}")
 
 # === 07/08 动态文档重置为空模板 ===

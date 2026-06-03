@@ -9,6 +9,7 @@ set "RUNTIME=%ROOT%runtime"
 set "LOCK=%RUNTIME%\novel_pipeline.bat.lock"
 set "PYLOCK=%RUNTIME%\novel_pipeline.lock"
 set "PYEXE=C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
+set "PYTHONIOENCODING=utf-8"
 
 if not exist "%RUNTIME%" mkdir "%RUNTIME%"
 

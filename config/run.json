@@ -10,8 +10,9 @@
   "artifact_retention": "clean",
   "auto_recover_on_start": true,
   "min_recover_article_chars": 1000,
-  "per_chapter_retries": 2,
-  "retry_backoff_seconds": 30,
+  "resume_partial_chapter": true,
+  "per_chapter_retries": 3,
+  "retry_backoff_seconds": 45,
   "story_director": {
    "enabled": true,
    "interval_chapters": 5
@@ -32,17 +33,17 @@
    "compressor": 200000
   },
   "max_input_tokens": {
-   "arc_planner": 35000,
-   "volume_planner": 40000,
-   "master_outline": 50000,
+   "arc_planner": 60000,
+   "volume_planner": 60000,
+   "master_outline": 60000,
    "fact_checker": 30000,
-   "beat_planner": 40000,
+   "beat_planner": 50000,
    "writer": 60000,
    "reviewer": 28000,
    "editor": 28000,
    "archivist": 38000,
    "compressor": 28000,
-   "story_director": 32000
+   "story_director": 45000
   },
   "request_timeout_seconds": 240,
   "sleep_seconds_between_calls": 1,

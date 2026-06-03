@@ -17,6 +17,9 @@ beats/
 # === 中间产物 / 历史快照（可重新生成）===
 分析草稿/
 台账版本/
+_重生备份_*/
+temp_章纲/
+scripts/run_pipeline_backup.py
 
 # === Python 缓存 ===
 __pycache__/

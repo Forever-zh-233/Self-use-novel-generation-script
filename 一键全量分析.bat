@@ -12,6 +12,7 @@ rem re-run and it continues from the last landed batch (atomic write + fingerpri
 
 set "ROOT=%~dp0"
 set "RUNTIME=%ROOT%runtime"
+set "ANALYST=%RUNTIME%\analyst"
 set "PYEXE=C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
 set "PYTHONIOENCODING=utf-8"
 
@@ -26,9 +27,7 @@ echo ------------------------------------------------------------
 echo   * Token-heavy: MAP input ~2.48M tok, 41 batches.
 echo   * Resumable: close window / shutdown any time, re-run to continue.
 echo   * Auto-rerun: if you edited any analyst prompt, the content hash
-echo     changes and ALL stale batches are re-run automatically (no need
-echo     to delete anything). Crash-resume still works when prompts are
-echo     unchanged.
+echo     changes and ALL stale batches are re-run automatically.
 echo   * Graceful stop: double-click the stop bat in this folder.
 echo ============================================================
 echo.
@@ -40,28 +39,79 @@ if errorlevel 2 (
   exit /b 0
 )
 
+:MENU
 echo.
 echo Run mode:
-echo   [R] Resume - keep valid batches, re-run only changed/missing ones
-echo                (normal choice; respects prompt-hash auto-rerun)
-echo   [C] Clean  - DELETE all analyst artifacts and re-run EVERYTHING
-echo                from batch 0 (burns full token cost again)
+echo   [R] Resume        - keep valid artifacts, re-run only changed/missing
+echo                       (normal; respects prompt-hash auto-rerun)
+echo   [C] Clean ALL     - delete the whole analyst folder, re-run everything
+echo   --- debug: delete one stage and force it to recompute ---
+echo   [M] redo MAP      - delete map batches + ALL downstream (merge/reduce/
+echo                       structure); full rebuild, full token cost
+echo   [P] redo PROSE    - delete merge cache + reduce output, keep MAP;
+echo                       re-run the prose REDUCE (the 8 technique cards)
+echo   [S] redo STRUCT   - delete the structure report, keep MAP;
+echo                       re-run only the structure REDUCE (calibration)
 echo.
-choice /c RC /n /m "Choose mode ([R]esume / [C]lean): "
-if errorlevel 2 goto ASK_CLEAN
+choice /c RCMPS /n /m "Choose ([R]esume/[C]lean/[M]ap/[P]rose/[S]truct): "
+set "SEL=%ERRORLEVEL%"
+if "%SEL%"=="5" goto DEL_STRUCT
+if "%SEL%"=="4" goto DEL_PROSE
+if "%SEL%"=="3" goto DEL_MAP
+if "%SEL%"=="2" goto CLEAN_ALL
 goto AFTER_MODE
 
-:ASK_CLEAN
+:CLEAN_ALL
 echo.
-echo You chose CLEAN. This will delete runtime\analyst\ entirely.
+echo You chose CLEAN ALL. This deletes runtime\analyst\ entirely.
 choice /c YN /n /m "Are you sure? This cannot be undone. (Y/N) "
-if errorlevel 2 (
-  echo Clean cancelled, falling back to Resume mode.
-  goto AFTER_MODE
-)
+if errorlevel 2 goto MENU
 echo Deleting runtime\analyst\ ...
-rmdir /s /q "%RUNTIME%\analyst" >nul 2>nul
+rmdir /s /q "%ANALYST%" >nul 2>nul
 echo Done. Starting a full clean re-run.
+goto AFTER_MODE
+
+:DEL_MAP
+echo.
+echo You chose redo MAP. This deletes map batches AND all downstream
+echo products (merge cache, reduce output, structure report), because
+echo everything is derived from MAP. Full rebuild, full token cost.
+choice /c YN /n /m "Are you sure? (Y/N) "
+if errorlevel 2 goto MENU
+echo Deleting MAP batches and downstream products ...
+del "%ANALYST%\map_*.md" >nul 2>nul
+del "%ANALYST%\merge_L*.md" >nul 2>nul
+del "%ANALYST%\_reduce_output.md" >nul 2>nul
+del "%ANALYST%\_structure_calibration.md" >nul 2>nul
+echo Done. Starting a full rebuild.
+goto AFTER_MODE
+
+:DEL_PROSE
+echo.
+echo You chose redo PROSE. This deletes the merge cache and reduce
+echo output but KEEPS the MAP batches, so only the prose REDUCE
+echo (the 8 technique cards) is recomputed. Cheap; good for tuning
+echo analyst_reduce.md / analyst_merge.md. The 8 chunk files are
+echo overwritten on re-run.
+choice /c YN /n /m "Are you sure? (Y/N) "
+if errorlevel 2 goto MENU
+echo Deleting merge cache + reduce output ...
+del "%ANALYST%\merge_L*.md" >nul 2>nul
+del "%ANALYST%\_reduce_output.md" >nul 2>nul
+echo Done. MAP kept; prose REDUCE will recompute.
+goto AFTER_MODE
+
+:DEL_STRUCT
+echo.
+echo You chose redo STRUCT. This deletes the structure calibration
+echo report but KEEPS the MAP batches, so only the structure REDUCE
+echo is recomputed. Cheap; good for tuning analyst_structure_reduce.md.
+choice /c YN /n /m "Are you sure? (Y/N) "
+if errorlevel 2 goto MENU
+echo Deleting structure report ...
+del "%ANALYST%\_structure_calibration.md" >nul 2>nul
+echo Done. MAP kept; structure REDUCE will recompute.
+goto AFTER_MODE
 
 :AFTER_MODE
 rem Clear any leftover stop/pause markers so a fresh run is not blocked.

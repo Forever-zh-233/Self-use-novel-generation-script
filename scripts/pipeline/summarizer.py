@@ -5,13 +5,12 @@
 后续 writer 和 reviewer 读取最近N章摘要，避免表达重复。
 """
 
-import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pipeline.core import (
     RUNTIME_DIR, cli_print, dump_json, load_json, read_text, manuscript_path,
+    extract_json_object,
 )
 
 SUMMARIES_DIR = RUNTIME_DIR / "summaries"
@@ -62,25 +61,16 @@ def generate_chapter_summary(
 
 
 def _parse_summary(raw: str, chapter: int) -> Dict[str, Any]:
-    """从 LLM 输出中提取 JSON。容错：去围栏、尾逗号。"""
-    text = raw.strip()
-    # 去 markdown 围栏
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        text = m.group(1)
-    else:
-        # 找第一个 { 到最后一个 }
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-
-    # 去尾逗号
-    text = re.sub(r",\s*([}\]])", r"\1", text)
-
+    """从 LLM 输出中提取 JSON。
+    复用 core.extract_json_object(去围栏 + 提取 {} + 字符串内未转义引号状态机净化),
+    与 beat/archivist/gates 同一条净化路径。摘要里 sentence_patterns 常带引号
+    (如 "X没Y"),老的手写去围栏+去尾逗号修不了字符串内引号,必炸。
+    摘要非关键路径:解析最终失败就回退空摘要(不停章)。"""
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        data = extract_json_object(raw)
+        if not isinstance(data, dict):
+            raise ValueError("顶层不是 JSON 对象")
+    except Exception:
         cli_print(f"[summarizer] 第{chapter}章摘要 JSON 解析失败，使用空摘要。")
         data = {}
 

@@ -1498,6 +1498,18 @@ def run(h: TestHarness) -> None:
         h.equal("bad parse defaults chapter", parsed3["chapter"], 7)
         h.equal("bad parse defaults empty actions", parsed3["signature_actions"], [])
 
+        # 回归:字符串内未转义引号(摘要 sentence_patterns 常带引号模板)。
+        # 原 _parse_summary 只做去围栏+去尾逗号,字符串内引号必炸→空摘要。
+        # 改走 core.extract_json_object(状态机净化)后应能解析。
+        quoted = '{"chapter":4,"sentence_patterns":["X没Y","一X。两X。"],"plot_digest":"出诊"}'
+        pq = summarizer._parse_summary(quoted, 4)
+        h.equal("带引号模板的摘要能解析(非空)", len(pq["sentence_patterns"]), 2)
+        h.equal("带引号摘要 plot_digest 正确", pq["plot_digest"], "出诊")
+        # 字符串内引号后跟中文标点,状态机应能修补
+        inner = '{"chapter":4,"plot_digest":"他说"算了"。转身就走"}'
+        pi = summarizer._parse_summary(inner, 4)
+        h.check("内部引号后跟中文标点能修补", bool(pi["plot_digest"]), repr(pi["plot_digest"]))
+
         # 测试 anti_repeat_for_writer — 手动写入摘要文件
         summaries_dir = tmp / "runtime" / "summaries"
         summaries_dir.mkdir(parents=True, exist_ok=True)

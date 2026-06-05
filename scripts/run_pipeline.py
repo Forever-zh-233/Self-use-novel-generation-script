@@ -17,10 +17,12 @@ r"""
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +36,7 @@ from pipeline.context import *  # noqa: F401,F403
 from pipeline.gates import *  # noqa: F401,F403
 from pipeline.planning import *  # noqa: F401,F403
 from pipeline.archivist import *  # noqa: F401,F403
+from pipeline.summarizer import generate_chapter_summary
 
 
 REJECTION_PATTERN = re.compile(
@@ -152,6 +155,21 @@ def beat_direction_check(beat: Dict[str, Any], chapter: int) -> Dict[str, Any]:
             hit = sum(1 for kw in keywords if kw in beat_blob)
             if keywords and hit >= max(2, len(keywords)):
                 issues.append(f"本章 beat 疑似重复了总监点名的模式:{rep}")
+        # —— 钩子型连续不变:可编程的"原地打转"硬信号 ——
+        # 只在总监要求收束类纠偏(tighten/merge/resolve/pivot)时启用:这类动作本意就是"别再吊同一个钩子"。
+        # 不做语义判断(系统触碰没/弧线靠拢没那种交给 reviewer),只查结构化字段 `钩子型` 是否照搬上一章。
+        action = str(director.get("correction_action") or "continue")
+        if action in {"tighten", "merge", "resolve", "pivot"}:
+            this_type = str(beat.get("钩子型") or "").strip()
+            prev_path = BASE_DIR / "beats" / f"chapter_{chapter - 1}.json"
+            prev_type = ""
+            if prev_path.exists():
+                prev_type = str((load_json(prev_path, {}) or {}).get("钩子型") or "").strip()
+            if this_type and prev_type and this_type == prev_type:
+                issues.append(
+                    f"总监要求{action}纠偏,但本章钩子型仍为「{this_type}」,与上一章相同——"
+                    f"换一型,别原地吊同一个钩子。"
+                )
     return {
         "passed": not issues,
         "issues": issues,
@@ -308,12 +326,47 @@ def ensure_beat(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], timeout:
         beat = normalize_beat(chapter, extract_json_object(raw))
         direction = beat_direction_check(beat, chapter)
         dump_json(role_artifact("gate", chapter, "beat_direction_retry.json"), direction)
+    # 钩子意象自查:让 beat_planner 对比近章钩子,判自己是否复用了相似意象/结构。
+    # 不靠硬编码检测——语义重复只有 LLM 能判。输入极短(<600 tok),每章无条件跑一次。
+    hook_self_check_raw = ""
+    if not run_cfg.get("dry_run") and not run_cfg.get("skip_hook_self_check"):
+        this_hook = beat.get("章末钩子") or ""
+        hooks_context = recent_hooks_digest(chapter)
+        if this_hook and hooks_context:
+            check_input = (
+                f"{hooks_context}\n\n"
+                f"本章(第{chapter}章)你刚写的钩子：\n"
+                f"- 钩子型：{beat.get('钩子型', '未标')}\n"
+                f"- 章末钩子：{this_hook}\n\n"
+                "请判断：本章钩子是否与上面任何一章复用了相似的意象、结构或指向？\n"
+                "（例如：都是同一角色/动物察觉异常；都是门外传来脚步声；都是某个气味/声音出现……）\n\n"
+                "如果复用了：输出一个 JSON，只包含新的 \"章末钩子\" 和 \"钩子型\" 两个字段，换一个全新意象。\n"
+                "如果没有复用：只输出 \"OK\"（不要输出别的）。"
+            )
+            check_result = call_role(
+                "beat_planner",
+                "你是章节 beat 规划师。现在做一次钩子自查。",
+                check_input,
+                role_artifact("beat", chapter, "hook_self_check.md"),
+                timeout,
+                600,
+            )
+            hook_self_check_raw = check_result
+            if check_result.strip().upper() != "OK":
+                new_hook_data = extract_json_object(check_result)
+                if new_hook_data and new_hook_data.get("章末钩子"):
+                    beat["章末钩子"] = new_hook_data["章末钩子"]
+                    if new_hook_data.get("钩子型"):
+                        beat["钩子型"] = new_hook_data["钩子型"]
+                    cli_print(f"[hook_self_check] 第{chapter}章钩子意象复用,已自动换新。")
+
     dump_json(beat_path, beat)
     # 调试留档(不受 cleanup 影响):每章一个子文件夹,存它当时被喂了什么、原样吐了什么、方向校验、最终 beat。
     write_beat_debug(chapter, {
         "beat_input.md": beat_input,
         "beat_raw.md": raw_first,
         "beat_raw_retry.md": raw_retry,
+        "hook_self_check.md": hook_self_check_raw,
         "direction.json": json.dumps(direction, ensure_ascii=False, indent=2),
         "beat.json": json.dumps(beat, ensure_ascii=False, indent=2),
     })
@@ -416,7 +469,6 @@ def run_fact_checker(final: str, beat: Dict[str, Any], chapter: int, run_cfg: Di
     ]
     input_text = "\n\n".join(input_sections)
     prompt = read_text(PROMPTS_DIR / "fact_checker.md")
-    cli_print(f"[fact_checker] 核查第{chapter}章,输入≈{estimate_tokens(input_text)} tokens")
     return call_role("fact_checker", prompt, input_text, role_artifact("gate", chapter, "fact_check.md"), timeout, 3000)
 
 
@@ -897,6 +949,14 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
             return
         final, verdict = result
 
+    # 写手摘要：轻量 LLM 调用，记录本章表达特征供后续章防重复
+    if not run_cfg.get("skip_summarizer"):
+        try:
+            generate_chapter_summary(chapter, final, timeout)
+            cli_print(f"[summarizer] 第{chapter}章写手摘要已生成。")
+        except Exception as exc:
+            cli_print(f"[summarizer] 第{chapter}章摘要生成失败（不影响正文）：{exc}")
+
     wait_if_paused("Archivist 更新台账前")
     started = stage_start(chapter, "archivist", "更新台账", 7, total_steps, chapter_index, total_chapters)
     archive_input = make_archive_input(final, chapter, run_cfg, timeout)
@@ -1045,6 +1105,118 @@ def analyst_batch_path(idx: int) -> Path:
     return ANALYST_DIR / f"map_{idx:04d}.md"
 
 
+# MAP 单批输出封顶:不顶满 analyst 配置的 131000。因为"全部 map 之和 = 单批输出 × 批数"
+# 必须 ≤ 模型 1M 窗口减输出余量,否则结构 REDUCE 一次吃不全、被迫分层(分层会切断跨批
+# 伏笔拼接的钥匙,是项目三头号敌人)。约48批 × 18000 ≈ 86万 ≤ 1M,留足 REDUCE 余量。
+ANALYST_MAP_OUTPUT_TOKENS = 18000
+
+# MAP/merge 落盘产物的格式版本指纹。续跑复用前校验:版本号或 batch 预算变了 → 旧产物失效、重跑该批,
+# 不无脑复用(否则旧格式批/不同分组的 merge 缓存会与新参数混用,污染结构 reduce 的跨批拼接)。
+# v2 = MAP 输出含「结构台账」两段格式。改格式/分批口径时,把版本号 +1。
+ANALYST_ARTIFACT_VERSION = "v2"
+
+
+def analyst_fingerprint(batch_budget: int) -> str:
+    return f"<<ANALYST-FMT {ANALYST_ARTIFACT_VERSION} batch={batch_budget}>>"
+
+
+def stamp_fingerprint(body: str, batch_budget: int) -> str:
+    """写盘时在首行盖指纹戳。"""
+    return f"{analyst_fingerprint(batch_budget)}\n{body}"
+
+
+def fingerprint_ok(text: str, batch_budget: int) -> bool:
+    """续跑复用前校验:首行指纹与当前(版本,预算)完全一致才算有效。
+    无指纹(旧产物)或指纹不符 → 视为失效,触发重跑。"""
+    first_line = text.lstrip().splitlines()[0] if text.strip() else ""
+    return first_line.strip() == analyst_fingerprint(batch_budget)
+
+
+def strip_fingerprint(text: str) -> str:
+    """读出供归并时去掉指纹戳行,只留正文。SKIP 标记不带指纹,原样返回。"""
+    s = text.lstrip()
+    if s.startswith("<<ANALYST-FMT "):
+        nl = s.find("\n")
+        return s[nl + 1:] if nl >= 0 else ""
+    return text
+
+
+def split_map_segments(map_text: str) -> tuple:
+    """把一份 MAP 产出切成 (手法观察, 结构台账) 两段。
+    MAP 被要求输出 `=== 手法观察 ===` 和 `=== 结构台账 ===` 两段,纪律相反:
+    手法观察禁真名(喂 prose reduce→写手),结构台账含真名(喂 structure reduce,不进写手)。
+    **铁律:prose reduce 绝不能吃到结构台账段,否则真名会顺着手法卡漏给写手。**
+    容错:模型偶尔把标记写成 `== 结构台账 ==`(=数量不足)或带多余空白,正则放宽到 ={2,}。
+    兜底(安全优先):切不出结构台账标记时,若文本带真名特征(@数字 / 第N章),
+    绝不把它当手法观察(那会漏真名给写手)——整体改判进结构段(只进人读报告、永不进写手),
+    宁可丢这批手法,也不漏真名。仅在确认无真名特征时,才安全地把整段当手法观察。"""
+    struct_marker = re.compile(r"={2,}\s*结构台账\s*={2,}")
+    tech_marker = re.compile(r"^\s*={2,}\s*手法观察\s*={2,}\s*", re.MULTILINE)
+    m = struct_marker.search(map_text)
+    if m:
+        structure = map_text[m.end():].strip()
+        technique = tech_marker.sub("", map_text[:m.start()], count=1).strip()
+        return technique, structure
+    # 没切出结构台账标记:模型漏写/写歪。带真名特征则整体进结构段(不冒漏真名的险)。
+    has_realname = bool(re.search(r"@\s*\d+", map_text) or re.search(r"第\s*\d+\s*章", map_text))
+    if has_realname:
+        return "", tech_marker.sub("", map_text, count=1).strip()
+    return tech_marker.sub("", map_text, count=1).strip(), ""
+
+
+
+def _run_one_map_batch(i: int, batch: str, map_prompt: str, batch_budget: int, timeout: int) -> str:
+    """单批 MAP worker(线程安全:只用局部状态,各写各的 .tmp.PID,落盘原子)。
+    返回状态字符串:'done' / 'rejected' / 'skipped'(已存在有效指纹批,续跑跳过)。
+    429/限流感知退避 + 随机抖动:命中限流时拉长等待,避免 N 线程一起重试形成风暴。
+    PAUSE 走文件式检查(不读键盘,键盘由主调度线程独占轮询,避免多线程抢 msvcrt)。"""
+    out_path = analyst_batch_path(i)
+    if out_path.exists():
+        existing = read_text(out_path).strip()
+        if existing.startswith("<<SKIP"):
+            return "skipped_rejected"
+        # 续跑复用前校验指纹:版本/预算一致才跳过;旧格式或不同预算 → 失效重跑。
+        if len(existing) > 50 and not is_rejection_text(existing) and fingerprint_ok(existing, batch_budget):
+            return "skipped_done"
+        if existing and len(existing) > 50 and not fingerprint_ok(existing, batch_budget):
+            cli_print(f"[analyst] 第 {i+1} 批是旧格式/旧预算产物(指纹不符),重跑。")
+    # 文件式暂停:被暂停时原地等,STOP 立即让出
+    while PAUSE_FILE.exists() and not STOP_FILE.exists():
+        time.sleep(0.5)
+    if STOP_FILE.exists():
+        return "stopped"
+    cli_print(f"[analyst] MAP 第 {i+1} 批 开跑,输入≈{estimate_tokens(batch)} tokens")
+    result = ""
+    ok = False
+    for attempt in range(3):
+        if STOP_FILE.exists():
+            return "stopped"
+        try:
+            result = call_model("analyst", map_prompt, batch, ANALYST_MAP_OUTPUT_TOKENS, timeout)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            is_rate = "429" in msg or "rate" in msg.lower() or "too many" in msg.lower()
+            # 限流:基数更大(15/30/45s);普通异常:5/10/15s。都叠 0~3s 抖动错开重试。
+            base = (15 * (attempt + 1)) if is_rate else (5 * (attempt + 1))
+            wait_s = min(base, 60) + random.uniform(0, 3)
+            tag = "限流(429)" if is_rate else "调用异常"
+            cli_print(f"[analyst] 第 {i+1} 批{tag}(第{attempt+1}/3次)，{wait_s:.0f}s 后重试：{msg[:80]}")
+            time.sleep(wait_s)
+            continue
+        if is_rejection_text(result):
+            cli_print(f"[analyst] 第 {i+1} 批被风控拒(第{attempt+1}/3次)：{result.strip()[:60]}")
+            time.sleep(min(5 * (attempt + 1), 20) + random.uniform(0, 3))
+            continue
+        ok = True
+        break
+    if ok:
+        write_text(out_path, stamp_fingerprint(result, batch_budget))
+        return "done"
+    # 拒绝是确定性的(源文该段触发),不无限重试:标记 SKIP 不喂归并
+    write_text(out_path, "<<SKIP: 本批被内容风控拒绝，已跳过，不参与归并>>")
+    cli_print(f"[analyst] 第 {i+1} 批三次失败/被拒,已标记跳过。")
+    return "rejected"
+
 
 def run_analyst(run_cfg: Dict[str, Any], dry_run: bool) -> None:
     """全量扫读管线入口。dry_run=True 只切批、估成本、写第一批 prompt,不调 API。"""
@@ -1071,72 +1243,175 @@ def run_analyst(run_cfg: Dict[str, Any], dry_run: bool) -> None:
         cli_print(f"[analyst] dry-run：未调用任何 API。去掉 --dry-run 才真正跑 {len(batches)} 批 MAP + 1 次 REDUCE。")
         return
 
-    # ---- MAP：逐批扫读,已完成的批跳过(断点续跑) ----
-    # 被风控拒的批写成 SKIP 标记,既不污染归并、又不会重跑时无限重试。
-    done = 0
-    rejected = 0
-    for i, batch in enumerate(batches):
-        out_path = analyst_batch_path(i)
-        if out_path.exists():
-            existing = read_text(out_path).strip()
-            if existing.startswith("<<SKIP"):
-                rejected += 1
-                continue
-            if len(existing) > 50 and not is_rejection_text(existing):
-                done += 1
-                continue
-        wait_if_paused(f"[analyst] MAP 第 {i+1}/{len(batches)} 批前")
-        if STOP_FILE.exists():
-            cli_print("[analyst] 检测到停止请求，已跑的批已落盘，重跑会续上。")
-            return
-        cli_print(f"[analyst] MAP {i+1}/{len(batches)} 批，输入≈{estimate_tokens(batch)} tokens")
-        result = ""
-        ok = False
-        for attempt in range(3):
-            try:
-                result = call_model("analyst", map_prompt, batch, role_max_output_tokens("analyst", 7000), timeout)
-            except Exception as exc:  # noqa: BLE001
-                cli_print(f"[analyst] 第 {i+1} 批调用异常(第{attempt+1}/3次)：{exc}")
-                time.sleep(min(5 * (attempt + 1), 20))
-                continue
-            if is_rejection_text(result):
-                cli_print(f"[analyst] 第 {i+1} 批被风控拒(第{attempt+1}/3次)：{result.strip()[:60]}")
-                time.sleep(min(5 * (attempt + 1), 20))
-                continue
-            ok = True
-            break
-        if ok:
-            write_text(out_path, result)
-            done += 1
-        else:
-            # 拒绝是确定性的(源文该段内容触发),不再无限重试:标记跳过,不喂进归并
-            write_text(out_path, "<<SKIP: 本批被内容风控拒绝，已跳过，不参与归并>>")
-            rejected += 1
-            cli_print(f"[analyst] 第 {i+1} 批两次失败/被拒,已标记跳过。")
+    # ---- MAP：并发扫读,已完成的批跳过(断点续跑) ----
+    # 每批读源文不同段落、批间零依赖,是 embarrassingly parallel。call_model/http_post
+    # 无共享可变状态(逐次重读配置、各写各的 .tmp.PID),并发安全。并发数 run.json 可配。
+    concurrency = int((run_cfg.get("analyst") or {}).get("map_concurrency") or 4)
+    done, rejected, stopped = run_map_phase(batches, map_prompt, batch_budget, timeout, concurrency)
 
+    if stopped:
+        # 收到停止请求:与原串行实现一致,直接返回,不跑 REDUCE(已落盘的批重跑会续上)
+        return
     if rejected:
         cli_print(f"[analyst] 注意：{rejected}/{len(batches)} 批被风控跳过(玄幻打斗/死亡段易触发)。手法高度冗余,丢几批不致命。")
 
     # ---- REDUCE：分层归并,任何环节都不把全部批堆给模型 ----
-    observations = []
+    # 把每批 MAP 切成两段:手法观察(禁真名,喂 prose reduce→写手)、结构台账(含真名,喂 structure reduce)。
+    observations = []   # 仅手法观察段
+    structure_logs = [] # 仅结构台账段
     for i in range(len(batches)):
         p = analyst_batch_path(i)
-        if p.exists():
-            content = read_text(p).strip()
-            if content and not content.startswith("<<SKIP") and not is_rejection_text(content):
-                observations.append(content)
-    if not observations:
+        if not p.exists():
+            continue
+        content = read_text(p).strip()
+        if not content or content.startswith("<<SKIP") or is_rejection_text(content):
+            continue
+        content = strip_fingerprint(content)
+        technique, structure = split_map_segments(content)
+        if technique:
+            observations.append(technique)
+        if structure:
+            structure_logs.append(f"【第{i+1}批】\n{structure}")
+    if not observations and not structure_logs:
         cli_print("[analyst] 没有可归并的 MAP 结果。")
         return
-    merge_prompt = read_text(PROMPTS_DIR / "analyst_merge.md")
-    group_size = int((run_cfg.get("analyst") or {}).get("merge_group_size") or 10)
-    reduce_out = hierarchical_reduce(
-        observations, merge_prompt, reduce_prompt, group_size, batch_budget, timeout
-    )
-    write_text(ANALYST_DIR / "_reduce_output.md", reduce_out)
-    written = split_and_write_technique_chunks(reduce_out)
-    cli_print(f"[analyst] 完成。写入手法 chunk：{', '.join(written) if written else '（无,检查 _reduce_output.md 分隔符）'}")
-    cli_print("[analyst] chunk 已登记 index.json，写手检索表已预接好关键词。")
+
+    # ---- prose REDUCE:分层归并手法观察,产手法 chunk(只吃手法观察段,绝不碰结构台账)----
+    if observations:
+        merge_prompt = read_text(PROMPTS_DIR / "analyst_merge.md")
+        group_size = int((run_cfg.get("analyst") or {}).get("merge_group_size") or 10)
+        reduce_out = hierarchical_reduce(
+            observations, merge_prompt, reduce_prompt, group_size, batch_budget, timeout
+        )
+        write_text(ANALYST_DIR / "_reduce_output.md", reduce_out)
+        written = split_and_write_technique_chunks(reduce_out)
+        cli_print(f"[analyst] prose 完成。写入手法 chunk：{', '.join(written) if written else '（无,检查 _reduce_output.md 分隔符）'}")
+        cli_print("[analyst] chunk 已登记 index.json，写手检索表已预接好关键词。")
+
+    # ---- 结构 REDUCE:全量一次喂,绝不分层(伏笔埋在第1批/收在第N批,必须同一上下文才拼得起来)----
+    if structure_logs:
+        # 结构 reduce 是最后一步、只跑一次、要读全部台账并可能吐很长报告:用独立放宽的 timeout,
+        # 不沿用 MAP 的全局 timeout(那个要小,否则每批超时重试会拖很久)。
+        struct_timeout = int((run_cfg.get("analyst") or {}).get("structure_reduce_timeout_seconds") or max(timeout, 500))
+        run_structure_reduce(structure_logs, struct_timeout)
+    else:
+        cli_print("[analyst] 无结构台账段(MAP 可能是旧版无台账输出),跳过结构校准报告。")
+
+
+def run_map_phase(batches: List[str], map_prompt: str, batch_budget: int,
+                  timeout: int, concurrency: int) -> tuple:
+    """并发跑 MAP 阶段,返回 (done, rejected, stopped)。stopped=True 表示收到停止请求、
+    应让上层直接返回(不跑 REDUCE),与原串行实现"STOP 即 return、不归并"一致。
+    设计:① 金丝雀首批——本次会话第一个要真跑的批先单独跑完,成功才扇出其余并发
+       (冷启动不一上来 N 连发触发限流;监视器最快拿到一个真批做格式体检;
+        新格式万一不对只废 1 批)。② 滑动窗口——始终保持 ≤concurrency 个在飞,
+       完成一个补一个;补之前查 STOP,STOP 在约 1 批延迟内生效,已落盘全保。
+       ③ 键盘 p/q 由本(主)线程在调度循环里轮询,worker 只查文件,无多线程抢键盘。"""
+    concurrency = max(1, int(concurrency))
+    total = len(batches)
+    done = rejected = 0
+
+    def tally(status: str) -> None:
+        nonlocal done, rejected
+        if status in ("done", "skipped_done"):
+            done += 1
+        elif status in ("rejected", "skipped_rejected"):
+            rejected += 1
+
+    # 待跑队列:已存在有效指纹/SKIP 的批 worker 会秒返回(skipped_*),不真调 API。
+    pending = list(range(total))
+    cli_print(f"[analyst] MAP 并发={concurrency},共 {total} 批(已完成的会自动跳过)。")
+
+    # ---- 金丝雀首批:跑 pending 里第一个真正需要调 API 的批 ----
+    canary_done = False
+    while pending and not canary_done:
+        if STOP_FILE.exists():
+            cli_print("[analyst] 检测到停止请求,已跑的批已落盘,重跑会续上。")
+            return done, rejected, True
+        i = pending[0]
+        # 先探一下它是不是已完成批(秒返回),是就计数后看下一个,直到撞上真要跑的
+        out_path = analyst_batch_path(i)
+        if out_path.exists():
+            existing = read_text(out_path).strip()
+            if existing.startswith("<<SKIP"):
+                rejected += 1; pending.pop(0); continue
+            if len(existing) > 50 and not is_rejection_text(existing) and fingerprint_ok(existing, batch_budget):
+                done += 1; pending.pop(0); continue
+        cli_print(f"[analyst] 金丝雀:先单独跑第 {i+1} 批验证格式,成功后再扇出 {concurrency} 并发。")
+        status = _run_one_map_batch(i, batches[i], map_prompt, batch_budget, timeout)
+        if status == "stopped":
+            cli_print("[analyst] 金丝雀阶段收到停止,已落盘的批保留。")
+            return done, rejected, True
+        tally(status); pending.pop(0); canary_done = True
+
+    # ---- 滑动窗口并发跑其余批 ----
+    poll_keyboard_control()  # 让 p/q 键在并发开始前也能登记
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        in_flight = {}  # future -> batch index
+        stopping = False
+        while (pending or in_flight) and not stopping:
+            # 补满窗口
+            while pending and len(in_flight) < concurrency and not STOP_FILE.exists():
+                i = pending.pop(0)
+                fut = pool.submit(_run_one_map_batch, i, batches[i], map_prompt, batch_budget, timeout)
+                in_flight[fut] = i
+            if STOP_FILE.exists():
+                stopping = True
+            if not in_flight:
+                break
+            finished, _ = wait(set(in_flight), timeout=2, return_when=FIRST_COMPLETED)
+            poll_keyboard_control()  # 主线程独占轮询键盘 p/q
+            for fut in finished:
+                i = in_flight.pop(fut)
+                try:
+                    status = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    cli_print(f"[analyst] 第 {i+1} 批 worker 异常:{exc}")
+                    status = "rejected"
+                if status == "stopped":
+                    stopping = True
+                else:
+                    tally(status)
+            if finished:  # 仅在有批真正完成时才打进度,避免退避等待期每 2s 刷屏
+                spent = done + rejected
+                cli_print(f"[analyst] 进度 {spent}/{total}（完成 {done}，跳过 {rejected}，在飞 {len(in_flight)}）")
+        if stopping:
+            # 等在飞的批自然跑完落盘(它们内部也查 STOP,会尽快收尾),不强杀
+            for fut in as_completed_safe(in_flight):
+                i = in_flight.get(fut)
+                try:
+                    status = fut.result()
+                    if status != "stopped":
+                        tally(status)
+                except Exception:  # noqa: BLE001
+                    pass
+            cli_print("[analyst] 已按停止请求收尾,落盘的批全部保留,重跑续上。")
+    return done, rejected, stopping
+
+def as_completed_safe(future_map):
+    """对在飞 future 做 as_completed,future_map 可能在迭代中被外部清空也不报错。"""
+    from concurrent.futures import as_completed
+    return as_completed(list(future_map))
+
+
+def run_structure_reduce(structure_logs: List[str], timeout: int) -> None:
+    """读全部批次的结构台账,一次性喂给结构分析师,产校准报告。
+    绝不分层:跨批拼接伏笔的埋(早批)与收(晚批)必须在同一上下文里完成,
+    分层归并会当场切断这条钥匙。mimo 1M 窗口下几十万 token 台账一次吃得下。
+    报告含真名(给人举证用),只落 _structure_calibration.md,不进任何 build_*_input、不进 chunks/。"""
+    structure_prompt = read_text(PROMPTS_DIR / "analyst_structure_reduce.md")
+    full_input = "\n\n========\n\n".join(structure_logs)
+    in_tok = estimate_tokens(full_input)
+    cli_print(f"[analyst] 结构 REDUCE：全量一次喂 {len(structure_logs)} 批台账,输入≈{in_tok} tokens（不分层,timeout={timeout}s）。")
+    if in_tok > 900000:
+        cli_print(f"[analyst] ⚠ 结构台账 {in_tok} tokens 逼近 1M 窗口,可能被截断。建议调大 batch_token_budget 减少批数,或减小 MAP 台账粒度。")
+    # 校准报告可能很长(逐条伏笔举证),输出上限放开到角色配置顶格(131000),不能用 MAP 的 18000 封顶
+    # 否则报告会被截断在 18000、跨批拼接的结论残缺。
+    report = call_model("analyst", structure_prompt, full_input, role_max_output_tokens("analyst", 131000), timeout)
+    out_path = ANALYST_DIR / "_structure_calibration.md"
+    write_text(out_path, report)
+    cli_print(f"[analyst] 结构校准报告已落盘 → {out_path}")
+    cli_print("[analyst] 报告含真名(举证用),仅供人工读后手动校准规划层 prompt;绝不进写手/规划输入。")
 
 
 
@@ -1179,16 +1454,19 @@ def hierarchical_reduce(
         next_layer: List[str] = []
         for gi, group in enumerate(groups):
             cache = ANALYST_DIR / f"merge_L{level}_G{gi:03d}.md"
-            if cache.exists() and len(read_text(cache).strip()) > 50:
-                next_layer.append(read_text(cache))
-                continue
+            if cache.exists():
+                cached = read_text(cache).strip()
+                # 指纹校验:batch 预算变了→分组边界变了,旧 merge 缓存张冠李戴,不复用。
+                if len(cached) > 50 and fingerprint_ok(cached, batch_budget):
+                    next_layer.append(strip_fingerprint(cached))
+                    continue
             wait_if_paused(f"[analyst] MERGE L{level} G{gi+1}/{len(groups)} 前")
             if STOP_FILE.exists():
                 cli_print("[analyst] 停止请求；已合并的组已落盘,重跑续上。")
                 raise KeyboardInterrupt("analyst stopped during merge")
             merged_in = "\n\n=== 下一份 ===\n".join(group)
             merged = call_model("analyst", merge_prompt, merged_in, role_max_output_tokens("analyst", 7000), timeout)
-            write_text(cache, merged)
+            write_text(cache, stamp_fingerprint(merged, batch_budget))
             next_layer.append(merged)
         layer = next_layer
 

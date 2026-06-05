@@ -13,6 +13,17 @@
 runtime/
 输出/
 beats/
+consistency/facts/
+consistency/reports/
+consistency/issues_raw.json
+consistency/watermark.json
+
+# === 一次性临时拼接脚本（不纳入版本）===
+_merge*.py
+_merge*.ps1
+_merge*.bat
+_append.ps1
+_full_merge.py
 
 # === 中间产物 / 历史快照（可重新生成）===
 分析草稿/
@@ -36,3 +47,7 @@ Thumbs.db
 *.tmp
 *.bak
 *_重写版.md
+*.rar
+*.zip
+*.7z
+备份.*

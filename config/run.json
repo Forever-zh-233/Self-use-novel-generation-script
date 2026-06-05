@@ -18,8 +18,10 @@
    "interval_chapters": 5
   },
   "analyst": {
-   "batch_token_budget": 40000,
-   "merge_group_size": 10
+   "batch_token_budget": 60000,
+   "map_concurrency": 4,
+   "merge_group_size": 10,
+   "structure_reduce_timeout_seconds": 500
   },
   "default_context_window_tokens": 200000,
   "compress_at_ratio": 0.8,
@@ -33,17 +35,17 @@
    "compressor": 200000
   },
   "max_input_tokens": {
-   "arc_planner": 60000,
+   "arc_planner": 100000,
    "volume_planner": 60000,
    "master_outline": 60000,
    "fact_checker": 30000,
-   "beat_planner": 50000,
+   "beat_planner": 100000,
    "writer": 60000,
    "reviewer": 28000,
    "editor": 28000,
-   "archivist": 38000,
+   "archivist": 45000,
    "compressor": 28000,
-   "story_director": 45000
+   "story_director": 58000
   },
   "request_timeout_seconds": 240,
   "sleep_seconds_between_calls": 1,

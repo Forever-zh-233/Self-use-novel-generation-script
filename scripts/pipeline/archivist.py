@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from pipeline.core import (
     BASE_DIR, STATE_FILE, ACTIVE_THREADS_FILE, LEDGER_FILE, LEDGER_MD_FILE,
-    CHARACTER_ARCS_FILE, VERSION_DIR, REALM_ORDER,
+    CHARACTER_ARCS_FILE, VERSION_DIR, REALM_ORDER, REALM_ORDER_WITH_MORTAL,
     _sanitize_model_json, append_text, cli_print, dump_json, load_json,
     read_text, write_text,
 )
@@ -143,9 +143,11 @@ def merge_state_update(update: Dict[str, Any]) -> None:
             node["touches"] = touches_list[-10:]
         dump_json(LEDGER_FILE, ledger)
     # 三线节奏:archivist 打的 dominant_strand 标签 → 更新计数器(归一化后)
+    # cultivation_active(none/trace/active):拆道途线混合袋,暴露修炼实质含量
     dominant_raw = update.get("dominant_strand")
     if dominant_raw and chapter_no:
-        update_strand_tracker(state, int(chapter_no), normalize_strand(dominant_raw))
+        cultivation = str(update.get("cultivation_active") or "").strip().lower()
+        update_strand_tracker(state, int(chapter_no), normalize_strand(dominant_raw), cultivation)
     dump_json(STATE_FILE, state)
     dump_json(ACTIVE_THREADS_FILE, threads)
     write_state_mirrors()
@@ -246,7 +248,15 @@ def merge_ledger_update(update: Dict[str, Any], chapter: int) -> None:
             merged_man = list(dict.fromkeys((cur.get("mannerisms") or []) + [str(m) for m in add if m]))
             cur["mannerisms"] = merged_man[-6:]
         if upd.get("realm_change"):
-            cur["realm"] = upd["realm_change"]
+            new_realm = upd["realm_change"]
+            old_realm = cur.get("realm") or ""
+            cur["realm"] = new_realm
+            # 境界进度历史(供 story_director 停滞观察):只在真的变了时记,记进 ledger 顶层
+            if new_realm and new_realm != old_realm:
+                rp = ledger.setdefault("realm_progress", {})
+                who_hist = rp.setdefault(name, [])
+                who_hist.append({"chapter": chapter, "from": old_realm, "to": new_realm})
+                rp[name] = who_hist[-12:]
         if upd.get("skills_remove"):
             remove_names = set()
             for sk in upd["skills_remove"]:
@@ -333,8 +343,7 @@ def merge_ledger_update(update: Dict[str, Any], chapter: int) -> None:
 
     # 技能过时机制:低于当前境界两阶以上的技能自动标"过时",写手看不到。
     # 不封顶数量,靠境界差自然淘汰。
-    REALM_ORDER = ["凡人", "叩门", "通脉", "凝元", "开窍", "化神", "归真", "明心", "通玄", "听道", "御道", "齐物", "忘我"]
-    realm_idx = {r: i for i, r in enumerate(REALM_ORDER)}
+    realm_idx = {r: i for i, r in enumerate(REALM_ORDER_WITH_MORTAL)}
     for e in entities.values():
         if not isinstance(e, dict):
             continue
@@ -363,6 +372,36 @@ def merge_ledger_update(update: Dict[str, Any], chapter: int) -> None:
     resources = ledger.setdefault("resources", {})
     for key, value in (block.get("resources") or {}).items():
         resources[key] = value
+
+    # 技能库：已有技能补细节/进展;新技能建卡
+    tech_lib = ledger.setdefault("technique_library", {})
+    for upd in block.get("technique_updates") or []:
+        if not isinstance(upd, dict) or not upd.get("name"):
+            continue
+        name = upd["name"]
+        if name not in tech_lib:
+            tech_lib[name] = {"owner": "?", "type": "?", "first_seen": chapter, "source": "", "core_details": {}, "evolution": []}
+        entry = tech_lib[name]
+        if upd.get("new_details") and isinstance(upd["new_details"], dict):
+            entry.setdefault("core_details", {}).update(upd["new_details"])
+        if upd.get("evolution_note"):
+            evol = entry.setdefault("evolution", [])
+            evol.append({"chapter": chapter, "note": upd["evolution_note"]})
+            entry["evolution"] = evol[-12:]
+    for new_tech in block.get("technique_new") or []:
+        if not isinstance(new_tech, dict) or not new_tech.get("name"):
+            continue
+        name = new_tech["name"]
+        if name in tech_lib:
+            continue
+        tech_lib[name] = {
+            "owner": new_tech.get("owner") or "?",
+            "type": new_tech.get("type") or "?",
+            "first_seen": chapter,
+            "source": new_tech.get("source") or "",
+            "core_details": new_tech.get("core_details") or {},
+            "evolution": [{"chapter": chapter, "note": "首次出现"}],
+        }
 
     # 未结清账：新增 obligation / 结清已有
     obligations = ledger.setdefault("obligations", [])
@@ -757,7 +796,7 @@ def merge_ledger_update(update: Dict[str, Any], chapter: int) -> None:
         state = load_state()
         tl = state.setdefault("timeline", {"absolute_day": 1, "time_of_day": "未知", "season": "未知", "pending_timers": []})
         if timeline_update.get("day_advance"):
-            tl["absolute_day"] = tl.get("absolute_day", 1) + timeline_update["day_advance"]
+            tl["absolute_day"] = float(tl.get("absolute_day") or 1) + float(timeline_update["day_advance"])
         if timeline_update.get("time_of_day"):
             tl["time_of_day"] = timeline_update["time_of_day"]
         if timeline_update.get("season_change"):
@@ -769,8 +808,8 @@ def merge_ledger_update(update: Dict[str, Any], chapter: int) -> None:
         for tid in timeline_update.get("timers_resolve") or []:
             tl["pending_timers"] = [t for t in tl.get("pending_timers", []) if t.get("event") != tid]
         # Auto-expire timers past due
-        current_day = tl.get("absolute_day", 1)
-        tl["pending_timers"] = [t for t in tl.get("pending_timers", []) if t.get("due_day", 999) >= current_day - 5]
+        current_day = float(tl.get("absolute_day") or 1)
+        tl["pending_timers"] = [t for t in tl.get("pending_timers", []) if float(t.get("due_day") or 999) >= current_day - 5]
         # Cap at 10
         tl["pending_timers"] = tl["pending_timers"][-10:]
         dump_json(STATE_FILE, state)

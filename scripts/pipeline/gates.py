@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pipeline.core import (
-    BASE_DIR, PROMPTS_DIR, _sanitize_model_json,
+    BASE_DIR, PROMPTS_DIR, REALM_ORDER_WITH_MORTAL, _sanitize_model_json,
     cli_print, manuscript_path, read_text, load_json,
 )
 from pipeline.state import (
@@ -165,7 +165,7 @@ def fact_check_against_ledger(text: str) -> List[str]:
                 warnings.append(f"死亡角色复活（{name}已死亡但在正文中非回忆语境出现）：{context_window[:40]}")
 
     # 6. Temporal 穿帮·境界倒退：正文写到某角色处于比账本记录更低的境界（修为只升不降，除非有跌境设定）
-    REALM_SEQ = ["凡人", "叩门", "通脉", "凝元", "开窍", "化神", "归真", "明心", "通玄", "听道", "御道", "齐物", "忘我"]
+    REALM_SEQ = REALM_ORDER_WITH_MORTAL
     for name, e in entities.items():
         if not isinstance(e, dict):
             continue
@@ -186,7 +186,7 @@ def fact_check_against_ledger(text: str) -> List[str]:
     # 7. Temporal 穿帮·过期计时器：正文把一个早已到期的悬置事件当作"还没发生/还来得及"
     state = load_state()
     tl = state.get("timeline") or {}
-    cur_day = tl.get("absolute_day", 1)
+    cur_day = float(tl.get("absolute_day") or 1)
     for timer in tl.get("pending_timers") or []:
         if not isinstance(timer, dict):
             continue
@@ -255,7 +255,10 @@ def hard_gate(text: str) -> Dict[str, Any]:
             issues.append(f"疑似源文专名污染: {word}")
     if re.search(r"LF-\d{3}", text):
         issues.append("正文泄露长线伏笔内部编号 LF-XXX。")
-    if re.search(r"第\d+章", text):
+    # 标题行 "# 第X章 标题" 是 writer 必须输出的格式(run_pipeline 清洗逻辑靠它当锚点切掉
+    # 模型吐在正文前的思考过程),不算泄露。只检测正文内部的"第X章":先剥离 markdown 标题行,再查。
+    body_no_heading = re.sub(r"^#+\s*第\d+章[^\n]*$", "", text, flags=re.MULTILINE)
+    if re.search(r"第\d+章", body_no_heading):
         issues.append("正文泄露元信息：出现'第X章'系统编号。角色回忆应用'上回/那天/之前'。")
     meta_leaks = ["beat", "台账", "角色卡", "卷纲", "弧线规划", "伏笔编号", "F-0"]
     for leak in meta_leaks:
@@ -470,7 +473,9 @@ def make_review_input(
     diagnostics: Optional[Dict[str, Any]] = None,
     beat: Optional[Dict[str, Any]] = None,
 ) -> str:
+    from pipeline.summarizer import repetition_context_for_reviewer
     checklist = cast_checklist_for_reviewer(text)
+    rep_ctx = repetition_context_for_reviewer(chapter)
     sections = [
         make_section("本章 beat（评判基准：写手是否忠实执行了这个规划）",
                      json.dumps(beat, ensure_ascii=False, indent=2) if beat else "无",
@@ -485,6 +490,7 @@ def make_review_input(
             False,
         ),
         make_section("出场角色核实清单", checklist, "high", False) if checklist else None,
+        make_section("近期章节表达摘要（检查本章是否重复）", rep_ctx, "high", True) if rep_ctx else None,
         make_section("待评审正文", text, "high", True),
     ]
     sections = [s for s in sections if s]

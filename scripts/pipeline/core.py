@@ -56,6 +56,10 @@ BEATS_DEBUG_DIR = BEATS_DIR / "_debug"
 REALM_ORDER = ["叩门", "通脉", "凝元", "开窍", "化神", "归真", "明心", "通玄", "听道", "御道", "齐物", "忘我"]
 REALM_ORDINALS = ["第一境", "第二境", "第三境", "第四境", "第五境", "第六境",
                   "第七境", "第八境", "第九境", "第十境", "第十一境", "第十二境"]
+# "凡人" 不是正式境界(12境从叩门起)，但 ledger/排序/比较需要表达"尚未叩门"的修炼前状态。
+# 统一这个带"凡人"前缀的序列，供 archivist 技能过时判断、gate 境界倒退检测、power_scaling
+# 窗口取值用——杜绝四处各自硬编码 ["凡人","叩门",...] 导致的漂移(老债:境界4处写死)。
+REALM_ORDER_WITH_MORTAL = ["凡人"] + REALM_ORDER
 
 CLIMAX_TENSIONS = ("高", "高潮", "爆")
 
@@ -177,10 +181,12 @@ def now_text() -> str:
 
 
 def cli_print(message: str) -> None:
+    line = f"[{now_text()}] {message}"
     try:
-        print(f"[{now_text()}] {message}", flush=True)
+        print(line, flush=True)
     except UnicodeEncodeError:
-        print(f"[{now_text()}] {message.encode('utf-8', errors='replace').decode('utf-8')}", flush=True)
+        sys.stdout.buffer.write((line + "\n").encode("utf-8", errors="replace"))
+        sys.stdout.buffer.flush()
 
 
 def write_progress(data: Dict[str, Any]) -> None:
@@ -196,7 +202,7 @@ def progress_bar(done: int, total: int, width: int = 20) -> str:
     done = max(0, min(done, total))
     filled = int(width * done / total)
     pct = int(100 * done / total)
-    return "=" * filled + "-" * (width - filled) + f" {pct}%"
+    return "▓" * filled + "░" * (width - filled) + f" {pct}%"
 
 
 def poll_keyboard_control() -> None:
@@ -391,35 +397,66 @@ def cleanup_chapter_artifacts(chapter: int, run_cfg: Dict[str, Any]) -> None:
 
 
 def _sanitize_model_json(payload: str) -> str:
-    """修复 mimo 在生成 JSON 时的结构性毛病,不改语义:
-    核心问题:mimo 在 JSON 字符串值内部放未转义的引号(中文对话里的引号直接用 ASCII 0x22),
-    导致 JSON 解析器提前截断字符串。
-    修法:识别"不该出现在字符串外"的引号(前后紧邻中文/标点),补反斜杠转义。"""
+    """修复 mimo 生成 JSON 时的结构性毛病,不改语义。
+
+    核心问题:mimo 在 JSON 字符串值内部放未转义的 ASCII 双引号(中文对话里的引号
+    直接用 0x22),解析器在那里误判字符串结束 → `Expecting ',' delimiter`。
+
+    旧实现靠正则猜"引号两侧字符类型"来判断该不该转义,有两个硬伤:
+    (1) 相邻匹配重叠消费字符(`说"好"然` 第一次匹配吃掉 `好`,第二个引号丢了左边界);
+    (2) 引号一侧是英文/数字/空格/ASCII标点时整个漏网。
+
+    新实现改用基于 JSON 结构的字符级状态机:一个 `"` 是不是字符串的合法闭合引号,
+    取决于它后面(跳过空白)是不是 `,` `}` `]` `:` 或字符串结尾——是则闭合,
+    否则它是字符串内部的杂散引号,补反斜杠转义。不靠猜字符类型,靠结构,无重叠问题。
+    同时把字符串内部的裸控制字符(换行/回车/制表)转义,避免 `Invalid control character`。"""
     s = payload.strip()
-    # 第一步:修复字符串内部的未转义引号。
-    # 正常 JSON 里,一个 " 如果是字符串边界,它前面/后面应该是:
-    #   结构字符 : , { } [ ] 或空白
-    # 如果一个 " 的前面是中文/中文标点,且后面也是中文/中文标点,那它是字符串内容里的引号,需要转义。
-    # 模式:中文字符 + " + 中文字符 → 中文字符 + \" + 中文字符
-    s = re.sub(
-        r'([一-鿿　-〿＀-￯])"([一-鿿　-〿＀-￯])',
-        r'\1\\"\2',
-        s,
-    )
-    # 也处理:中文标点 + " + 中文(如 ，"小山)
-    s = re.sub(
-        r'([，。！？、；：])"([一-鿿])',
-        r'\1\\"\2',
-        s,
-    )
-    # 以及:中文 + " + 中文标点(如 有数"，)
-    s = re.sub(
-        r'([一-鿿])"([，。！？、；：　-〿])',
-        r'\1\\"\2',
-        s,
-    )
-    # 第二步:去掉对象/数组的尾逗号
-    s = re.sub(r',(\s*[}\]])', r'\1', s)
+    out: List[str] = []
+    in_string = False
+    n = len(s)
+    i = 0
+    terminators = {",", "}", "]", ":"}
+    while i < n:
+        ch = s[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        # 字符串内部
+        if ch == "\\":
+            # 保留既有转义序列,连同被转义的下一个字符原样输出(不二次转义)
+            out.append(ch)
+            if i + 1 < n:
+                out.append(s[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if ch == '"':
+            # 向后跳过空白,看下一个有意义字符是否为结构终结符
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j >= n or s[j] in terminators:
+                out.append('"')  # 合法闭合引号
+                in_string = False
+            else:
+                out.append('\\"')  # 字符串内部的杂散引号 → 转义
+            i += 1
+            continue
+        if ch == "\n":
+            out.append("\\n"); i += 1; continue
+        if ch == "\r":
+            out.append("\\r"); i += 1; continue
+        if ch == "\t":
+            out.append("\\t"); i += 1; continue
+        out.append(ch)
+        i += 1
+    s = "".join(out)
+    # 去掉对象/数组的尾逗号
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
     return s
 
 

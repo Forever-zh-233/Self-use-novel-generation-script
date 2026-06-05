@@ -62,7 +62,7 @@
     "fact_checker": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
-      "max_output_tokens": 3000
+      "max_output_tokens": 5000
     },
     "volume_planner": {
       "provider": "mimo_main",
@@ -77,12 +77,12 @@
     "analyst": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
-      "max_output_tokens": 7000
+      "max_output_tokens": 131000
     },
     "beat_planner": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
-      "max_output_tokens": 1800
+      "max_output_tokens": 3000
     },
     "writer": {
       "provider": "mimo_main",
@@ -92,7 +92,7 @@
     "reviewer": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
-      "max_output_tokens": 3000
+      "max_output_tokens": 6000
     },
     "editor": {
       "provider": "mimo_main",
@@ -102,9 +102,19 @@
     "archivist": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
-      "max_output_tokens": 8000
+      "max_output_tokens": 16000
     },
     "compressor": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 3000
+    },
+    "summarizer": {
+      "provider": "mimo_main",
+      "model": "mimo-v2.5-pro",
+      "max_output_tokens": 1500
+    },
+    "consistency_mapper": {
       "provider": "mimo_main",
       "model": "mimo-v2.5-pro",
       "max_output_tokens": 3000

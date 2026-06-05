@@ -202,14 +202,60 @@ def _trim_state_for_context(state: Dict[str, Any], chapter: int = 0) -> Dict[str
     return s
 
 
+def _foreshadowing_digest_lines(threads: Dict[str, Any], chapter: int = 0,
+                                full_recent: int = 18, oldest_listed: int = 15) -> List[str]:
+    """未回收伏笔的有界摘要，替代全量 dump。
+    病根：旧逻辑把【历史上所有】未标回收的伏笔（到136章已 270 条 / 3.5万 token）
+    整本 dump 进 story_director/volume_planner/archivist，且与「期待账本.md」重复一遍。
+    伏笔几乎从不被标回收，所以这个表只增不减，是 token 无界膨胀的头号元凶。
+    改法（分级时效，同 recent_ledger_tail 哲学）：
+    - 近 full_recent 条（按埋设章倒序）给字段摘要（去掉 notes，规划层定位用 promise 足够）；
+    - 更早的不逐条列（245 条每条一行也有 1 万 token，规划师不会逐条看），只报总数 +
+      列出【埋设最早】的 oldest_listed 条（埋得越久越该担心烂尾，最该被提醒还债）。
+    真正的过期/临期点名由 overdue_foreshadowing_digest 负责，这里只给全局概览。"""
+    fs = threads.get("foreshadowing")
+    if not isinstance(fs, dict):
+        return []
+    unresolved = [
+        (k, v) for k, v in fs.items()
+        if isinstance(v, dict)
+        and v.get("status") not in ("已回收", "已结", "部分回收")
+        and not v.get("resolved_chapter")
+    ]
+    if not unresolved:
+        return ["## 未回收伏笔\n（暂无）"]
+
+    def _plant(item: Dict[str, Any]) -> int:
+        pc = item.get("planted_chapter") or 0
+        try:
+            return int(re.search(r"\d+", str(pc)).group())
+        except (AttributeError, ValueError):
+            return 0
+
+    by_recent = sorted(unresolved, key=lambda kv: _plant(kv[1]), reverse=True)
+    recent = by_recent[:full_recent]
+    older = by_recent[full_recent:]
+
+    def _brief(v: Dict[str, Any]) -> Dict[str, Any]:
+        return {kk: vv for kk, vv in v.items() if kk != "notes" and vv not in ("", [], {}, None)}
+
+    out = [f"## 未回收伏笔（共 {len(unresolved)} 条）"]
+    out.append(f"### 近 {len(recent)} 条（按埋设倒序，字段摘要）")
+    out.append(json.dumps({k: _brief(v) for k, v in recent}, ensure_ascii=False, indent=2))
+    if older:
+        oldest = sorted(older, key=lambda kv: _plant(kv[1]))[:oldest_listed]
+        out.append(f"### 更早 {len(older)} 条中，埋设最早的 {len(oldest)} 条（最该警惕烂尾，详细过期清单见过期警告）")
+        for k, v in oldest:
+            promise = v.get("promise") or v.get("hint") or v.get("type") or ""
+            out.append(f"- {k}（埋第{_plant(v)}章）：{str(promise)[:40]}")
+    return out
+
+
 def structured_state_text(chapter: int = 0) -> str:
     state = _trim_state_for_context(load_state(), chapter)
     threads = load_active_threads()
-    fs = threads.get("foreshadowing")
-    if isinstance(fs, dict):
-        unresolved = {k: v for k, v in fs.items()
-                      if not (isinstance(v, dict) and (v.get("status") in ("已回收", "已结") or v.get("resolved_chapter")))}
-        threads = {**threads, "foreshadowing": unresolved}
+    # 伏笔单独走有界摘要（_foreshadowing_digest_lines），不再随 threads 全量 dump
+    threads_rest = {k: v for k, v in threads.items() if k != "foreshadowing"}
     summary = read_text(VOLUME_SUMMARY_FILE, "")
 
     lines: List[str] = []
@@ -227,7 +273,8 @@ def structured_state_text(chapter: int = 0) -> str:
     if lines:
         parts.append("\n".join(lines))
     parts.append("## current_state.json\n" + json.dumps(state, ensure_ascii=False, indent=2))
-    parts.append("## active_threads.json（仅未回收）\n" + json.dumps(threads, ensure_ascii=False, indent=2))
+    parts.append("## active_threads.json（不含伏笔，伏笔见下）\n" + json.dumps(threads_rest, ensure_ascii=False, indent=2))
+    parts.append("\n".join(_foreshadowing_digest_lines(threads, chapter)))
     if summary.strip():
         parts.append("## volume_summary.md\n" + summary)
     return "\n\n".join(parts)
@@ -362,16 +409,21 @@ def normalize_strand(label: Any) -> str:
     return ""
 
 
-def update_strand_tracker(state: Dict[str, Any], chapter: int, dominant: str) -> None:
+def update_strand_tracker(state: Dict[str, Any], chapter: int, dominant: str,
+                          cultivation: str = "") -> None:
     """把本章 dominant_strand 记进 state['strand_tracker']。dominant 已归一化。
-    无法识别的标签不污染计数器(只记 history,不更新 last_*),保证崩溃重建安全。"""
+    无法识别的标签不污染计数器(只记 history,不更新 last_*),保证崩溃重建安全。
+    cultivation: 本章修炼实质含量 none/trace/active(拆道途线混合袋用),空串则不记。"""
     if not dominant:
         return
     tracker = state.setdefault("strand_tracker", {})
     history = tracker.setdefault("history", [])
     # 去重:同章重复提交只保留最后一次(崩溃重建可能重跑本章)
     history[:] = [h for h in history if int(h.get("chapter", -1)) != chapter]
-    history.append({"chapter": chapter, "dominant": dominant})
+    entry = {"chapter": chapter, "dominant": dominant}
+    if cultivation in ("none", "trace", "active"):
+        entry["cultivation"] = cultivation
+    history.append(entry)
     history.sort(key=lambda h: int(h.get("chapter", 0)))
     tracker["history"] = history[-60:]  # 有界:只留最近 60 章
     key_map = {"道途线": "last_道途", "情义线": "last_情义", "天地线": "last_天地"}

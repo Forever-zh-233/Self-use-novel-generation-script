@@ -77,6 +77,33 @@ class RequestTimeout(RuntimeError):
     """请求总时长超过硬上限仍未返回。偶发性错误，由 call_role 重试。"""
 
 
+class OutputTruncated(RuntimeError):
+    """模型输出在 max_output_tokens 处被硬截断。call_role 会加大预算重试。
+    携带已生成的部分文本(partial)，末次重试仍截断时回退使用，行为不劣于旧逻辑。"""
+
+    def __init__(self, message: str, partial: str = "") -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
+def _is_truncated_response(provider_type: str, data: Dict[str, Any]) -> bool:
+    """识别"因 token 上限被截断"。识别不到一律当未截断(回退旧行为，零回归)。"""
+    try:
+        if provider_type == "openai_chat":
+            choices = data.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                return choices[0].get("finish_reason") == "length"
+        elif provider_type == "openai_responses":
+            if data.get("status") == "incomplete":
+                reason = (data.get("incomplete_details") or {}).get("reason")
+                return reason == "max_output_tokens"
+        elif provider_type == "anthropic":
+            return data.get("stop_reason") == "max_tokens"
+    except Exception:
+        return False
+    return False
+
+
 def http_post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     """带总时长硬超时的 POST (daemon thread + Event.wait)。"""
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -141,7 +168,8 @@ def extract_anthropic_text(data: Dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
-def call_model(role: str, instructions: str, input_text: str, max_output_tokens: int, timeout: int) -> str:
+def call_model(role: str, instructions: str, input_text: str, max_output_tokens: int, timeout: int,
+               raise_on_truncate: bool = False) -> str:
     cfg = role_config(role)
     provider_type = cfg.get("type") or cfg.get("provider_type") or cfg.get("provider") or "openai_responses"
     model = os.environ.get(f"NOVEL_{role.upper()}_MODEL") or cfg.get("model")
@@ -226,6 +254,10 @@ def call_model(role: str, instructions: str, input_text: str, max_output_tokens:
 
     if not text:
         raise RuntimeError(f"角色 {role} 的 API 返回为空。")
+    if raise_on_truncate and _is_truncated_response(provider_type, data):
+        raise OutputTruncated(
+            f"角色 {role} 输出在 {max_output_tokens} token 上限处被截断。", partial=text
+        )
     return text
 
 
@@ -242,6 +274,7 @@ def call_role(
     default_max_tokens: int,
     input_path: Optional[Path] = None,
     reject_retries: int = 3,
+    truncate_escalations: int = 2,
 ) -> str:
     if input_path:
         write_text(input_path, input_text)
@@ -251,25 +284,43 @@ def call_role(
     input_tokens = estimate_tokens(input_text)
     cli_print(f"  → {role} │ {input_tokens:,} tok │ {model}")
     # 偶发故障(风控拒绝 + 请求超时)在这里重试,连续 reject_retries 次才停章。
+    # 输出截断是另一类失败:同预算重试必然再撞上限,所以加倍预算重试(escalations 次),
+    # 末次仍截断则回退用已生成的部分文本(不劣于旧的静默截断行为)。
     result = ""
     last = ""
-    for attempt in range(1, reject_retries + 1):
+    budget = role_max_output_tokens(role, default_max_tokens)
+    escalated = 0
+    max_attempts = reject_retries + truncate_escalations
+    reject_count = 0
+    for attempt in range(1, max_attempts + 1):
         try:
-            result = call_model(role, instructions, input_text, role_max_output_tokens(role, default_max_tokens), timeout)
+            result = call_model(role, instructions, input_text, budget, timeout, raise_on_truncate=True)
         except RequestTimeout as exc:
             last = str(exc)[:120]
-            cli_print(f"{role} 第 {attempt}/{reject_retries} 次请求超时：{last}")
-            if attempt < reject_retries:
+            cli_print(f"{role} 第 {attempt} 次请求超时：{last}")
+            reject_count += 1
+            if reject_count < reject_retries:
                 time.sleep(min(5 * attempt, 20))
                 continue
             raise RuntimeError(f"角色 {role} 连续 {reject_retries} 次请求超时，停在本章。") from exc
+        except OutputTruncated as exc:
+            if escalated < truncate_escalations:
+                escalated += 1
+                budget *= 2
+                cli_print(f"{role} 输出被截断，第 {escalated} 次加大预算到 {budget} token 重试。")
+                continue
+            # 预算已加到上限仍截断:回退用部分文本，让上层校验/净化去兜底。
+            cli_print(f"{role} 加大预算 {escalated} 次后仍被截断，回退使用部分输出({len(exc.partial)} 字)。")
+            result = exc.partial
+            break
         if not is_rejection_text(result):
             break
         last = result.strip()[:80]
-        cli_print(f"{role} 第 {attempt}/{reject_retries} 次被内容风控拒绝：{last}")
-        if attempt < reject_retries:
+        reject_count += 1
+        cli_print(f"{role} 第 {reject_count}/{reject_retries} 次被内容风控拒绝：{last}")
+        if reject_count < reject_retries:
             time.sleep(min(5 * attempt, 20))
-    else:
+            continue
         raise RuntimeError(f"角色 {role} 连续 {reject_retries} 次被内容风控拒绝，停在本章。")
     write_text(output_path, result)
     return result

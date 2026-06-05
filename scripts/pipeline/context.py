@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from pipeline.core import (
     BASE_DIR, PROMPTS_DIR, CONFIG_DIR, RUNTIME_DIR,
     VOLUME_SUMMARY_FILE, CHARACTER_ARCS_FILE, LONG_FORESHADOWING_FILE,
-    WRITER_MODULES_DIR, REALM_ORDER, REALM_ORDINALS,
+    WRITER_MODULES_DIR, REALM_ORDER, REALM_ORDER_WITH_MORTAL, REALM_ORDINALS,
     cli_print, estimate_tokens, load_json, manuscript_path, read_text,
     role_artifact, write_text,
 )
@@ -62,11 +62,11 @@ def writer_state_digest(beat: Dict[str, Any]) -> str:
     tl = state.get("timeline") or {}
     if tl:
         lines.append(f"【时间线】第{tl.get('absolute_day', '?')}日·{tl.get('time_of_day', '?')}·{tl.get('season', '?')}")
-        cur_day = tl.get("absolute_day") or 0
+        cur_day = float(tl.get("absolute_day") or 0)
         # 只显示未过期的高紧急计时器(due_day 已过的是陈旧数据,不再提醒)
         urgent = [
             t for t in (tl.get("pending_timers") or [])
-            if t.get("urgency") in ("极高", "高") and (t.get("due_day") or 999) >= cur_day
+            if t.get("urgency") in ("极高", "高") and float(t.get("due_day") or 999) >= cur_day
         ]
         for t in urgent[:3]:
             lines.append(f"  ⚠ {t.get('event','')}（截止第{t.get('due_day','?')}日）")
@@ -494,6 +494,33 @@ def ledger_context_for_writer(beat: Dict[str, Any], current_chapter: int = 0) ->
         )
         lines.extend(stance_lines[:4])
 
+    # —— 技能库：beat 里提到的技能/针法/功法注入完整卡,保证写手知道已确立的细节 ——
+    tech_lib = ledger.get("technique_library") or {}
+    if tech_lib:
+        matched_techs = []
+        for tech_name, tech_data in tech_lib.items():
+            # 匹配策略:技能全名、名字里的2+字子串、type 拆词
+            candidates = [tech_name]
+            for n in range(2, len(tech_name) + 1):
+                for i in range(len(tech_name) - n + 1):
+                    frag = tech_name[i:i + n]
+                    if len(frag) >= 2:
+                        candidates.append(frag)
+            if tech_data.get("type"):
+                candidates.extend(t for t in tech_data["type"].split("/") if len(t) >= 2)
+            if any(c in beat_text for c in candidates):
+                matched_techs.append((tech_name, tech_data))
+        if matched_techs:
+            lines.append("\n【技能详情·已确立的操作细节（写到该技能时保持一致,但不限制你发展新细节）】")
+            for tech_name, td in matched_techs[:5]:
+                details = td.get("core_details") or {}
+                detail_str = "；".join(f"{k}={v}" for k, v in details.items() if v)
+                evol = td.get("evolution") or []
+                last_evol = evol[-1]["note"] if evol else ""
+                lines.append(f"- 【{tech_name}】({td.get('type','')}) {detail_str}")
+                if last_evol:
+                    lines.append(f"  最新进展：{last_evol}")
+
     return "\n".join(lines).strip() or "暂无正典账本记录（开篇章节正常）。"
 
 
@@ -533,6 +560,28 @@ def recent_ledger_tail(max_chars: int = 6000) -> str:
     return result
 
 
+def recent_expectation_tail(lookback: int = 6, max_chars: int = 6000) -> str:
+    """期待账本（08-期待账本.md）有界读取，同 recent_ledger_tail 的思路。
+    病根：archivist 每章 append「### 第N章自动更新」块，到136章已 136 块 / 近3万 token，
+    却被 story_director/volume_planner/arc_planner 三处全量 read_text 注入。
+    它本是 append-only 人类可读账本，全量注入纯属冗余——规划层要的「当前还有哪些
+    未回收伏笔」已由 structured_state_text 的有界伏笔摘要 + overdue_foreshadowing_digest
+    覆盖。这里只给表头 + 最近 lookback 章的增量块。"""
+    text = read_text(BASE_DIR / "08-期待账本.md")
+    if not text:
+        return ""
+    blocks = re.split(r"(?=### 第\d+章自动更新)", text)
+    head = blocks[0] if blocks and not blocks[0].lstrip().startswith("### 第") else ""
+    chapter_blocks = [b for b in blocks if b.lstrip().startswith("### 第")]
+    recent = chapter_blocks[-lookback:] if chapter_blocks else []
+    result = (head.strip() + "\n\n" + "\n".join(recent).strip()).strip()
+    if not result:
+        result = (head or text)[:1500]
+    if len(result) > max_chars:
+        result = result[:len(head) + 200] + "\n…（更早增量已省略，未回收全貌见结构化状态的伏笔摘要）\n" + result[-max_chars:]
+    return result
+
+
 def safe_story_core_for_writer() -> str:
     """Writer 只拿明线设定，避免提前知道暗线真相。"""
     text = read_text(BASE_DIR / "09-故事核.md", "")
@@ -563,13 +612,19 @@ def safe_story_core_for_writer() -> str:
 
 
 def current_mc_realm() -> str:
-    """从 state.json 读 MC 当前境界，缺省叩门。"""
+    """MC 当前境界。权威源是 ledger.entities.沈安.realm（archivist 维护、gate/power_scaling
+    都读它）；state.mc_realm 只是旧的兜底镜像，长期从没被写过（=None），导致这里以前永远
+    返回 fallback「叩门」，而 ledger 记的却是「凡人」——两个数据源各说各话，是 realm 卡死
+    bug 的一半根因。改为：ledger.realm 优先，其次 state.mc_realm，最后才 fallback。"""
+    ledger = load_ledger()
+    mc = (ledger.get("entities") or {}).get("沈安", {})
+    led_realm = mc.get("realm") if isinstance(mc, dict) else None
     state = load_state()
-    realm = state.get("mc_realm")
-    if isinstance(realm, str):
-        for name in REALM_ORDER:
-            if name in realm:
-                return name
+    for src in (led_realm, state.get("mc_realm")):
+        if isinstance(src, str) and src.strip():
+            for name in REALM_ORDER:
+                if name in src:
+                    return name
     return "叩门"
 
 
@@ -776,6 +831,28 @@ def compress_sections_if_needed(
     return final_text
 
 
+def planner_craft_chunks() -> str:
+    """给规划层(arc_planner)看的原书手法卡:多视角切换/三线交织/修炼线编织/配角塑造。
+    这几张是 analyst 从原书学的【规划层该懂的编织手法】,不同于 writer 的句法卡。
+    存在才注入(C 阶段 analyst 重跑产出后 index 里才有),不存在静默返回空串——
+    先接好这根管子,等 C 的料产出自动生效(先接管子后灌料)。"""
+    index = load_index()
+    if not index:
+        return ""
+    planner_cards = ["多视角切换", "三线交织", "修炼线编织", "配角塑造"]
+    parts = []
+    for key in planner_cards:
+        if key in index:
+            body = load_chunk(key, index)
+            if body.strip():
+                parts.append(f"### {key}\n{body.strip()}")
+    if not parts:
+        return ""
+    return ("以下是分析师从原书提炼的编织手法（学它的做法，不是套公式；"
+            "原书怎么切视角/编三线/写修炼/塑配角，借鉴其节奏与轻重缓急）：\n\n"
+            + "\n\n".join(parts))
+
+
 def select_chunks(beat: Dict[str, Any]) -> Dict[str, str]:
     index = load_index()
     selected: Dict[str, str] = {}
@@ -830,6 +907,12 @@ def select_chunks(beat: Dict[str, Any]) -> Dict[str, str]:
         ("主题对位", ["主题", "立场", "论辩", "信念", "价值", "对错", "该不该", "慈悲", "代价", "意义", "折射"]),
         ("自欺与道德灰度", ["自欺", "心结", "心病", "矛盾", "灰度", "两难", "道德", "纠结", "嘴硬", "逃避", "回避"]),
         ("升级代价", ["突破", "境界", "变强", "升级", "修为", "面板", "解锁", "提升", "战力", "代价"]),
+        # analyst 五维度新卡(C 阶段重跑后 index 才有;没跑前 chunk_name not in index 不点亮)
+        ("信息差经营", ["信息差", "隐瞒", "瞒", "不知道", "识破", "暴露", "装", "潜台词", "试探", "盘算", "秘密"]),
+        ("配角塑造", ["配角", "出场角色", "议程", "盘算", "他自己的", "旁人", "路人", "其他角色"]),
+        ("多视角切换", ["视角", "POV", "切视角", "他的眼睛", "换视角", "另一个人"]),
+        ("修炼线编织", ["修炼", "境界", "真气", "瓶颈", "突破", "灵气", "修为", "运气", "丹田", "经脉", "修炼锚点"]),
+        ("三线交织", ["三线", "道途", "情义", "天地", "交织", "缠绕", "并行", "多线"]),
     ]
     # 关键词功能卡:按命中强度排序取前 N 张,避免 beat 撞多了全点亮把 writer 输入推爆。
     # 必选卡(黄金法则/负空间/AI腔/场景价值转变/潜台词/场景/角色)不在此列,不受 cap 限制。
@@ -940,6 +1023,53 @@ def strand_digest_for_director(chapter: int) -> str:
     consec = int(tracker.get("consecutive") or 0)
     cur = tracker.get("current_dominant") or "?"
     lines.append(f"当前连续主导:「{cur}」×{consec}章")
+
+    # 道途线混合袋拆解:在道途线主导的章里,有多少是真有修炼实质(active),
+    # 多少只是行医/治心病。暴露空洞给 story_director 定性判断,不设硬阈值。
+    cult_cfg = cfg.get("cultivation_sub_tag") or {}
+    if cult_cfg.get("enabled"):
+        dao_window = [h for h in window if normalize_strand(h.get("dominant")) == "道途线"]
+        if dao_window:
+            from collections import Counter as _C
+            cc = _C(h.get("cultivation") or "none" for h in dao_window)
+            active = cc.get("active", 0)
+            trace = cc.get("trace", 0)
+            none_n = cc.get("none", 0)
+            nd = len(dao_window)
+            # 全局看:最近一次有修炼实质(active)是第几章
+            last_active = max((int(h.get("chapter", 0)) for h in history
+                               if h.get("cultivation") == "active"), default=0)
+            gap_note = f"，距上次修炼实质已 {chapter - last_active} 章" if last_active else "，窗口内从无修炼实质"
+            lines.append(
+                f"【道途线含修炼实质】道途线 {nd} 章中:实质修炼 {active}、夹缝带过 {trace}、纯行医无修炼 {none_n}"
+                f"（修炼实质占道途线 {int(active/nd*100)}%{gap_note}）"
+            )
+            lines.append("  （供定性判断:道途线达标不代表修炼有存在感。若长期纯行医、修炼实质为零,说明'修行'名存实亡。是否该让境界往前啃由你判断,不是必须每章修炼。）")
+    return "\n".join(lines)
+
+
+def realm_progress_digest(chapter: int) -> str:
+    """给 story_director 看的主角境界进度·停滞观察(定性,不设硬阈值)。
+    realm 卡死曾是 bug(archivist 从不推进 realm,卡'凡人'到130章)。修复后这里暴露:
+    当前境界、进入该境界多少章了、距上次跨境多久——让 director 定性判断'修行是否停摆',
+    而不是机械要求'每 N 章必须突破'(那会诱发注水突破)。"""
+    ledger = load_ledger()
+    mc = (ledger.get("entities") or {}).get("沈安", {})
+    if not isinstance(mc, dict):
+        return ""
+    realm = mc.get("realm") or "凡人"
+    hist = (ledger.get("realm_progress") or {}).get("沈安") or []
+    lines = [f"【主角境界】当前:{realm}"]
+    if hist:
+        last = hist[-1]
+        last_ch = int(last.get("chapter") or 0)
+        gap = chapter - last_ch
+        lines.append(f"  上次跨境:第{last_ch}章 {last.get('from','?')}→{last.get('to','?')}（已 {gap} 章未再跨境）")
+        path = "→".join([hist[0].get("from", "?")] + [h.get("to", "?") for h in hist])
+        lines.append(f"  境界轨迹:{path}")
+    else:
+        lines.append(f"  ⚠ 账本中无任何跨境记录。若正文里主角早已会运气/用术法,说明 realm 落后于剧情(历史欠账),archivist 应主动补正。")
+    lines.append("  （定性参考:修炼是脊梁线。若境界长期停滞且正文也无'啃瓶颈'的实质过程,可考虑让修行往前走一步——但何时突破由剧情决定,不强求节奏。）")
     return "\n".join(lines)
 
 
@@ -1013,8 +1143,8 @@ def power_scaling_for_chapter() -> str:
     scaling = load_json(scaling_file, {})
     ledger = load_ledger()
     mc = (ledger.get("entities") or {}).get("沈安", {})
-    mc_realm = mc.get("realm", "叩门")
-    REALMS = ["凡人", "叩门", "通脉", "凝元", "开窍", "化神", "归真"]
+    mc_realm = mc.get("realm") or "叩门"
+    REALMS = REALM_ORDER_WITH_MORTAL[:7]  # 凡人..归真，power_scaling.json 只配到前段
     idx = REALMS.index(mc_realm) if mc_realm in REALMS else 1
     show_realms = REALMS[max(0, idx-1):idx+2]
     lines = []
@@ -1126,6 +1256,11 @@ def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
     sig_warn = recent_signature_warnings(chapter)
     if sig_warn:
         sections.append(make_section("近期重复动作禁用清单", sig_warn, "critical", False))
+    # 写手摘要防重复（基于最近章节的 LLM 生成摘要，比硬编码正则覆盖面更广）
+    from pipeline.summarizer import anti_repeat_for_writer
+    summary_warn = anti_repeat_for_writer(chapter)
+    if summary_warn:
+        sections.append(make_section("近期章节表达摘要·避免重复", summary_warn, "high", True))
     # 空间布局（防穿帮·按需）：本章有布局指令或本章地点有既有布局时才注入，否则静默
     spatial = layout_for_writer(beat)
     if spatial:

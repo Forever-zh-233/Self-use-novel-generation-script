@@ -29,6 +29,17 @@
   },
   "ratio_lookback": 20,
   "_ratio_lookback说明": "统计配比时回看的章数窗口;断档红线用绝对章号差,不受此窗口限制",
+  "cultivation_sub_tag": {
+    "_说明": "道途线混合袋拆解:道途线=行医+修炼捆在一起,连续60章行医也算道途线达标,但修炼含量可能为零。archivist 每章额外打 cultivation_active(none/trace/active),代码统计道途线里修炼的实质占比,暴露空洞给 story_director 定性判断。不设硬阈值(soft_only),只暴露数字。",
+    "enabled": true,
+    "levels": {
+      "none": "本章无任何修炼/境界/真气/瓶颈/突破内容",
+      "trace": "夹缝中提了一句(如'他感到丹田一暖'),无实质进展或场景",
+      "active": "有可感知的修炼实质:瓶颈被啃/境界进展/真气运用成为场景的一部分"
+    },
+    "lookback": 20,
+    "_lookback说明": "统计修炼实质占比的回看窗口,与三线 ratio_lookback 对齐"
+  },
   "ramp_up_chapters": 10,
   "_ramp_up说明": "开篇前 N 章允许道途线占比更高(织网期),不触发断档提示",
   "nag_cooldown": 4,

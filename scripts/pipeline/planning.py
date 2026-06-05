@@ -25,8 +25,9 @@ from pipeline.state import (
 from pipeline.context import (
     compress_sections_if_needed, emotional_distribution_warnings,
     ledger_context_for_planner, long_foreshadowing_text, make_section,
-    pacing_variety_warnings, recent_ledger_tail, render_sections,
+    pacing_variety_warnings, recent_expectation_tail, recent_ledger_tail, render_sections,
     safe_cultivation_for_writer, strand_digest_for_director, strand_pacing_warnings,
+    realm_progress_digest, planner_craft_chunks,
     spatial_digest_for_arc, layout_for_beat,
 )
 
@@ -211,10 +212,11 @@ def build_story_director_input(chapter: int, detected: Dict[str, Any], run_cfg: 
         make_section("全书骨架摘要(全局定位,详细规划见卷纲)", outline_digest, "high", True),
         make_section("卷纲", read_text(VOLUME_PLAN_FILE), "critical", False),
         make_section("当前活跃弧线", json.dumps(load_active_arcs(), ensure_ascii=False, indent=2), "high", True),
-        make_section("期待账本", read_text(BASE_DIR / "08-期待账本.md"), "high", True),
+        make_section("期待账本", recent_expectation_tail(), "high", True),
         make_section("结构化当前状态", structured_state_text(), "high", True),
         make_section("线索与揭示台账", threads_digest_for_director(chapter) or "（暂无线索台账记录）", "high", True),
         make_section("三线节奏配比", strand_digest_for_director(chapter) or "（暂无三线记录）", "high", True),
+        make_section("主角境界进度(停滞观察,定性参考)", realm_progress_digest(chapter), "high", True),
         make_section("最近章节正文摘录", recent_text_blob(chapter, lookback=3), "normal", True),
         make_section("最近 beat 摘要", recent_beats_summary(chapter, lookback=5), "normal", True),
     ]
@@ -564,7 +566,7 @@ def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> N
         make_section("当前章节号", f"第{chapter}章。请为接下来的卷生成卷纲。", "critical", False),
         make_section("正典账本(角色关系网/资源/约束/实体)", read_text(LEDGER_MD_FILE, "暂无。"), "high", False),
         make_section("结构化当前状态", structured_state_text(), "high", True),
-        make_section("期待账本(未回收伏笔)", read_text(BASE_DIR / "08-期待账本.md"), "high", True),
+        make_section("期待账本(未回收伏笔)", recent_expectation_tail(), "high", True),
         make_section("长线伏笔资产库", read_text(LONG_FORESHADOWING_FILE), "high", True),
         make_section("长线伏笔进度表(本卷该推进哪几条)", long_foreshadowing_progress(chapter), "critical", False),
         make_section("上卷结构化回顾(承上启下的关键依据)", volume_summary(chapter), "high", False),
@@ -787,6 +789,7 @@ def recent_scene_devices_digest(chapter: int, lookback: int = 10) -> str:
     return "\n".join(lines)
 
 
+def previous_arcs_summary() -> str:
     """上一批弧线的收束摘要:怎么结的、留了什么尾巴。给新弧线承上启下用。"""
     arcs = load_active_arcs()
     if not arcs:
@@ -801,6 +804,57 @@ def recent_scene_devices_digest(chapter: int, lookback: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _fmt_range(v: Any) -> str:
+    """[3,8] → '3-8章';字符串原样;数字 → 'N章'。"""
+    if isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
+        return f"{v[0]}-{v[1]}章"
+    if isinstance(v, (int, float)):
+        return f"{v}章"
+    return str(v)
+
+
+def structure_norms_digest(scope: str = "arc") -> str:
+    """把 config/structure_norms.json 的"本书结构参考分布"格式化成可注入文本。
+    这些数字是从本书原文(analyst 校准报告)数出的【参考分布,非 KPI】——换书时只换这个 JSON,
+    arc_planner.md/beat_planner.md 的原理一字不改。文件不存在则返回空串(优雅跳过,不破坏未配置的书)。
+    scope='arc' 给弧线规划师全量;scope='beat' 只给 beat_planner 它用得上的「呼吸cadence」。"""
+    norms = load_json(BASE_DIR / "config" / "structure_norms.json")
+    if not norms:
+        return ""
+    lines: List[str] = [
+        "以下是从本书原文数出的结构【参考分布】(典型值,不是红线/KPI——别凑数字,按剧情自然需要,数字只供参考):"
+    ]
+
+    def emit_group(title: str, key: str) -> None:
+        data = norms.get(key)
+        if not isinstance(data, dict):
+            return
+        parts = []
+        for k, v in data.items():
+            if k.startswith("_"):  # 下划线开头是给人看的说明,不注入
+                continue
+            parts.append(f"{k}={_fmt_range(v)}")
+        if parts:
+            lines.append(f"- {title}:" + "; ".join(parts))
+
+    if scope == "beat":
+        emit_group("呼吸节奏 cadence", "呼吸cadence")
+        body = "\n".join(lines)
+        return body if len(lines) > 1 else ""
+
+    # arc 全量
+    emit_group("弧长分级(按类型)", "弧长分级章数")
+    emit_group("节点间距(随进程)", "节点间距随进程章数")
+    emit_group("伏笔回收窗口(按类型)", "伏笔回收窗口章数")
+    emit_group("憋占比(按弧型)", "憋占比按弧型")
+    emit_group("反差窗口", "反差窗口章数")
+    emit_group("物件复现间距", "物件复现间距章数")
+    emit_group("闭环率分布", "闭环率分布")
+    emit_group("呼吸节奏 cadence", "呼吸cadence")
+    body = "\n".join(lines)
+    return body if len(lines) > 1 else ""
+
+
 def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
     growth_file = BASE_DIR / "config" / "growth_arcs.md"
     growth_text = read_text(growth_file) if growth_file.exists() else ""
@@ -812,13 +866,17 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
         make_section("【硬约束】卷纲(弧线必须在此框架内,不可违背事件顺序和结局)", read_text(BASE_DIR / "卷纲" / "10-卷纲.md"), "critical", False),
         make_section("当前状态摘要", structured_state_for_planner(chapter), "high", True),
         make_section("正典账本摘要", ledger_context_for_planner(chapter), "high", True),
-        make_section("期待账本(未回收伏笔)", read_text(BASE_DIR / "08-期待账本.md"), "normal", True),
+        make_section("期待账本(未回收伏笔)", recent_expectation_tail(), "normal", True),
         make_section("长线伏笔资产库(卷纲交代的长线伏笔全貌,你负责战术落地)", read_text(LONG_FORESHADOWING_FILE), "high", True),
         make_section("长线伏笔进度表(本弧该顺手推进哪几条)", long_foreshadowing_progress(chapter), "high", False),
         make_section("最近章节 beat 回顾", recent_beats_summary(chapter), "normal", True),
     ]
     if growth_text:
         sections.append(make_section("角色成长轨迹(规划弧线时标注本弧的成长阶段和心态变化)", growth_text, "high", True))
+    # 本书结构参考分布(项目三 D:数字与原理分离,原理在 arc_planner.md,数字在 config/structure_norms.json)
+    norms_text = structure_norms_digest("arc")
+    if norms_text:
+        sections.append(make_section("本书结构参考分布(弧长/节点间距/伏笔窗口/反差/物件/闭环——参考非KPI)", norms_text, "high", True))
     # 空间方位摘要（防穿帮·按需）：已登记地点的相对方位，规划场景群时遵守
     spatial = spatial_digest_for_arc(chapter)
     if spatial:
@@ -845,6 +903,22 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
         sections.append(make_section(
             "三线节奏配比(规划弧线时统筹道途/情义/天地的平衡)",
             strand_digest,
+            "normal", True,
+        ))
+    # 主角境界进度(停滞观察):规划本弧修炼线时参考,决定该不该安排实质推进
+    realm_digest = realm_progress_digest(chapter)
+    if realm_digest:
+        sections.append(make_section(
+            "主角境界进度(规划修炼线时参考,停滞观察非KPI)",
+            realm_digest,
+            "normal", True,
+        ))
+    # 原书编织手法卡(C 阶段 analyst 产出后才有,存在才注入):多视角/三线/修炼/配角
+    craft = planner_craft_chunks()
+    if craft:
+        sections.append(make_section(
+            "原书编织手法(借鉴其切视角/编三线/写修炼/塑配角的做法,非套公式)",
+            craft,
             "normal", True,
         ))
     # 人物债账到期:规划整条弧(几十章)时,把挂久的老债编进弧线节点了结
@@ -984,7 +1058,7 @@ def active_arcs_for_beat(chapter: int) -> str:
 def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
     sections = [
         make_section("目标章节", f"第{chapter}章", "critical", False),
-        make_section("故事总监批注(方向参考，保持自然阅读感)", story_director_context(chapter), "critical", False),
+        make_section("故事总监批注(severity≥2时其点名的纠偏动作是【硬约束】必须本章执行；执行要自然，忌打卡式生硬纠偏)", story_director_context(chapter), "critical", False),
         make_section("故事核", read_text(BASE_DIR / "09-故事核.md"), "critical", False),
         make_section("修炼境界安全参考", safe_cultivation_for_writer(), "normal", True),
         make_section("卷纲", read_text(BASE_DIR / "卷纲" / "10-卷纲.md"), "high", True),
@@ -1003,6 +1077,10 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
     emotion_warn = emotional_distribution_warnings(chapter)
     if emotion_warn:
         sections.append(make_section("情绪分布警告", emotion_warn, "high", False))
+    # 本书呼吸节奏参考(项目三 D:数字进 JSON,beat_planner.md 只留原理)。给 beat_planner 它用得上的那条。
+    norms_text = structure_norms_digest("beat")
+    if norms_text:
+        sections.append(make_section("本书呼吸节奏参考(连续高强度/缓冲/连续低强度上限——参考非KPI)", norms_text, "normal", True))
     # 钩子去重(单章职责):给 beat_planner 看最近几章的章末钩子+型，连续重复时一级预警。
     # 不可压缩——重复钩子是读者最敏感的"原地打转"信号。
     hooks_digest = recent_hooks_digest(chapter)

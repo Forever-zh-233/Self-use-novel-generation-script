@@ -1012,6 +1012,61 @@ def run(h: TestHarness) -> None:
             h.not_includes("校准报告不登记进写手 index", idx.read_text(encoding="utf-8"), "structure_calibration")
         h.check("校准报告不在 chunks 目录", not (rp.CHUNKS_DIR / "_structure_calibration.md").exists(), "")
 
+    h.section("scenario: 结构 REDUCE 风控拒绝重试——偶发拒绝能重试放行/耗尽不写垃圾报告")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        rp = _import_run_pipeline()
+        REJECT = "The request was rejected because it was considered high risk"
+        good = "# 结构校准报告\n## 一、伏笔分析\n铜铃@48→@91 间距43章\n【可入 prompt】信物类伏笔典型间隔约40章"
+        logs = [f"【第{i}批】\n- 出现的物件: 铜铃@{i*10}" for i in range(1, 4)]
+
+        # (a) 前两次被风控拒、第三次成功 → 报告应是成功内容,不是拒绝语
+        st = {"n": 0}
+
+        def flaky(role, instr, inp, max_out, timeout):
+            st["n"] += 1
+            return REJECT if st["n"] <= 2 else good
+
+        orig = rp.call_model
+        orig_sleep = rp.time.sleep
+        rp.call_model = flaky
+        rp.time.sleep = lambda *a, **k: None  # 测试里不真等退避(finally 必恢复,否则污染全局)
+        try:
+            rp.run_structure_reduce(logs, timeout=5)
+        finally:
+            rp.call_model = orig
+        report = rp.ANALYST_DIR / "_structure_calibration.md"
+        h.check("拒绝后重试到第3次", st["n"] == 3, f"calls={st['n']}")
+        h.check("最终报告落盘", report.exists(), str(report))
+        h.includes("报告是成功内容不是拒绝语", report.read_text(encoding="utf-8"), "铜铃")
+        h.not_includes("报告不含风控拒绝语", report.read_text(encoding="utf-8"), "high risk")
+
+        # (b) 一直被拒(重试耗尽)→ 绝不把拒绝语写盘冒充报告;旧报告保留不被覆盖
+        report.write_text("# 旧的有效报告\n铜铃@48", encoding="utf-8")
+        rp.call_model = lambda *a, **k: REJECT
+        try:
+            rp.run_structure_reduce(logs, timeout=5)
+        finally:
+            rp.call_model = orig
+        h.not_includes("耗尽后不写拒绝语", report.read_text(encoding="utf-8"), "high risk")
+        h.includes("耗尽后保留旧报告", report.read_text(encoding="utf-8"), "旧的有效报告")
+
+        # (c) call_analyst_with_retry 直接单测:拒绝→成功路径返回成功内容
+        st2 = {"n": 0}
+
+        def flaky2(role, instr, inp, max_out, timeout):
+            st2["n"] += 1
+            return REJECT if st2["n"] == 1 else good
+
+        rp.call_model = flaky2
+        try:
+            out = rp.call_analyst_with_retry("p", "in", 7000, 5, label="单测", retries=4)
+        finally:
+            rp.call_model = orig
+            rp.time.sleep = orig_sleep  # 恢复真 sleep,避免污染后续场景
+        h.includes("包装函数重试后返回成功内容", out, "铜铃")
+        h.check("包装函数重试计数正确", st2["n"] == 2, f"n={st2['n']}")
+
     h.section("scenario: MAP 并发调度——真并发/拒绝写SKIP/续跑跳过/STOP优雅停")
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)

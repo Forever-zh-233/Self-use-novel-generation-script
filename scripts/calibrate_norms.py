@@ -225,6 +225,13 @@ def main() -> None:
         cli_print(f"[calibrate] 校准报告不存在:{report_path}。请先跑 --analyst 生成报告。")
         sys.exit(1)
     report = read_text(report_path)
+    # 防线:结构 REDUCE 若曾被风控拒绝/截断,报告可能是几十字的拒绝语或残片。
+    # 绝不拿它喂 LLM 抽数字(会抽出垃圾覆盖 JSON)。识别到就拒绝继续,要求重跑 analyst。
+    stripped = report.strip()
+    if len(stripped) < 800 or "rejected because it was considered high risk" in stripped.lower():
+        cli_print(f"[calibrate] 校准报告异常（{len(stripped)} 字符，疑似风控拒绝/截断残片）:{stripped[:80]}")
+        cli_print("[calibrate] 请重跑 --analyst 让结构 REDUCE 重新产出完整报告后再校准。已中止,未改 JSON。")
+        sys.exit(1)
     probes = load_realname_probes()
     cli_print(f"[calibrate] 读报告 {report_path}（{len(report)} 字符），真名探针 {len(probes)} 个。")
 

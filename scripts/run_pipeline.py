@@ -1069,6 +1069,37 @@ def is_rejection_text(text: str) -> bool:
     return bool(REJECTION_PATTERN.search(s))
 
 
+def call_analyst_with_retry(prompt: str, input_text: str, max_tokens: int, timeout: int,
+                            label: str, retries: int = 4) -> str:
+    """analyst 的 REDUCE 链(结构/merge/prose)统一调用入口:带风控拒绝+异常重试。
+    根因教训:这几步原先裸调 call_model,风控拒绝(HTTP 200、content 整段是高风险拒绝语)
+    第一次就被当成结果写盘。而风控拒绝多为偶发采样,重试几次大概率放行——MAP 早有这套循环,
+    REDUCE 却漏接了。这里补齐,口径与 MAP 一致(指数退避+抖动错开)。
+    retries 次后仍被拒/异常才抛 RuntimeError(确定性失败,不无限重),由上层决定怎么兜。"""
+    last = ""
+    for attempt in range(retries):
+        if STOP_FILE.exists():
+            raise KeyboardInterrupt(f"analyst stopped before {label}")
+        try:
+            result = call_model("analyst", prompt, input_text, max_tokens, timeout)
+        except Exception as exc:  # noqa: BLE001
+            last = str(exc)[:80]
+            msg = str(exc)
+            is_rate = "429" in msg or "rate" in msg.lower() or "too many" in msg.lower()
+            base = (15 * (attempt + 1)) if is_rate else (5 * (attempt + 1))
+            wait_s = min(base, 60) + random.uniform(0, 3)
+            tag = "限流(429)" if is_rate else "调用异常"
+            cli_print(f"[analyst] {label}{tag}(第{attempt+1}/{retries}次)，{wait_s:.0f}s 后重试：{last}")
+            time.sleep(wait_s)
+            continue
+        if is_rejection_text(result):
+            last = result.strip()[:60]
+            cli_print(f"[analyst] {label}被风控拒(第{attempt+1}/{retries}次)，退避后重试：{last}")
+            time.sleep(min(8 * (attempt + 1), 40) + random.uniform(0, 3))
+            continue
+        return result
+    raise RuntimeError(f"analyst {label} 连续 {retries} 次被风控拒绝/调用失败：{last}")
+
 
 def split_source_into_batches(text: str, batch_token_budget: int) -> List[str]:
     """按 `第N章` 边界把全文切成批,每批累计到 token 预算才断。
@@ -1435,7 +1466,18 @@ def run_structure_reduce(structure_logs: List[str], timeout: int) -> None:
         cli_print(f"[analyst] ⚠ 结构台账 {in_tok} tokens 逼近 1M 窗口,可能被截断。建议调大 batch_token_budget 减少批数,或减小 MAP 台账粒度。")
     # 校准报告可能很长(逐条伏笔举证),输出上限放开到角色配置顶格(131000),不能用 MAP 的 18000 封顶
     # 否则报告会被截断在 18000、跨批拼接的结论残缺。
-    report = call_model("analyst", structure_prompt, full_input, role_max_output_tokens("analyst", 131000), timeout)
+    # 走带重试的统一入口:风控拒绝多为偶发,重试几次大概率放行(早先裸调 call_model,
+    # 第一次被拒就把"高风险拒绝语"当报告写盘了,这是真 bug)。
+    try:
+        report = call_analyst_with_retry(
+            structure_prompt, full_input,
+            role_max_output_tokens("analyst", 131000), timeout,
+            label="结构 REDUCE",
+        )
+    except RuntimeError as exc:
+        # 重试耗尽:绝不把拒绝语写盘冒充报告(否则 calibrate_norms 会吃到垃圾)。
+        cli_print(f"[analyst] ⚠ 结构 REDUCE 最终失败,保留旧报告不覆盖：{exc}")
+        return
     out_path = ANALYST_DIR / "_structure_calibration.md"
     write_text(out_path, report)
     cli_print(f"[analyst] 结构校准报告已落盘 → {out_path}")
@@ -1493,14 +1535,22 @@ def hierarchical_reduce(
                 cli_print("[analyst] 停止请求；已合并的组已落盘,重跑续上。")
                 raise KeyboardInterrupt("analyst stopped during merge")
             merged_in = "\n\n=== 下一份 ===\n".join(group)
-            merged = call_model("analyst", merge_prompt, merged_in, role_max_output_tokens("analyst", 7000), timeout)
+            merged = call_analyst_with_retry(
+                merge_prompt, merged_in,
+                role_max_output_tokens("analyst", 7000), timeout,
+                label=f"MERGE L{level} G{gi+1}",
+            )
             write_text(cache, stamp_fingerprint(merged, batch_budget))
             next_layer.append(merged)
         layer = next_layer
 
     final_in = "\n\n=== 下一份 ===\n".join(layer)
     cli_print(f"[analyst] REDUCE 最终归并：{len(layer)} 份,输入≈{estimate_tokens(final_in)} tokens")
-    return call_model("analyst", reduce_prompt, final_in, role_max_output_tokens("analyst", 7000), timeout)
+    return call_analyst_with_retry(
+        reduce_prompt, final_in,
+        role_max_output_tokens("analyst", 7000), timeout,
+        label="prose REDUCE",
+    )
 
 
 

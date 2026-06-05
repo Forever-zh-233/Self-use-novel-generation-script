@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """清除所有章节级生成物，保留配置/提示词/设定文档/源码/骨架/卷纲。"""
 
+import os
 import shutil
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parents[1]
+# 与 pipeline.core 一致:优先认 NOVEL_WORKSPACE,缺省才用脚本相对路径。
+# 这样测试能指向隔离临时工作区,绝不误删真实工作区。
+BASE = Path(os.environ.get("NOVEL_WORKSPACE") or Path(__file__).resolve().parents[1])
 OUTPUT = BASE / "输出"
 RUNTIME = BASE / "runtime"
 
@@ -55,6 +58,10 @@ for sub in output_subdirs:
 # === beats/ ===
 rm_contents(BASE / "beats", "beats")
 
+# === 写手摘要 runtime/summaries/（summarizer 每章生成，章节级动态产物） ===
+# 必须清:残留旧章摘要会污染下一轮 anti_repeat_for_writer / reviewer 的防重复参照。
+rm_contents(RUNTIME / "summaries", "runtime/summaries")
+
 # === 卷纲（由 volume_planner 生成，重跑会重新生成） ===
 rm_file(BASE / "卷纲" / "10-卷纲.md", "卷纲/10-卷纲.md")
 
@@ -82,8 +89,14 @@ runtime_files = [
 for name in runtime_files:
     rm_file(RUNTIME / name, f"    {name}")
 
-# runtime/analyst/ 内容
-rm_contents(RUNTIME / "analyst", "  runtime/analyst")
+# === 残留运行日志 ===
+for log in RUNTIME.glob("*.log"):
+    rm_file(log, f"    {log.name}")
+
+# 注意：绝不删 runtime/analyst/（全文扫读产物）和 chunks/ 里的手法卡。
+# 全量分析是独立的一次性重活（烧 $几、跑几小时），由「一键全量分析.bat」
+# 的 Clean/redo-MAP/PROSE/STRUCT 选项单独管理。清小说和清分析是两个脚本，
+# 各干各的——重跑小说不该让你白烧整本书的分析。
 
 # 锁和停止文件（残留的）
 for lock in ["novel_pipeline.lock", "novel_pipeline.bat.lock", "stop.request", "pause.request"]:

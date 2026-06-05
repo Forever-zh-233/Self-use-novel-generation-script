@@ -1247,6 +1247,7 @@ def _run_one_map_batch(i: int, batch: str, map_prompt: str, batch_budget: int, t
     cli_print(f"[analyst] MAP 第 {i+1} 批 开跑,输入≈{estimate_tokens(batch)} tokens")
     result = ""
     ok = False
+    last_fail = ""  # "rejection"=风控拒绝(确定性) / "error"=异常(401/网络/超时,临时)
     for attempt in range(3):
         if STOP_FILE.exists():
             return "stopped"
@@ -1260,10 +1261,12 @@ def _run_one_map_batch(i: int, batch: str, map_prompt: str, batch_budget: int, t
             wait_s = min(base, 60) + random.uniform(0, 3)
             tag = "限流(429)" if is_rate else "调用异常"
             cli_print(f"[analyst] 第 {i+1} 批{tag}(第{attempt+1}/3次)，{wait_s:.0f}s 后重试：{msg[:80]}")
+            last_fail = "error"  # 异常是临时的(认证/网络/超时),绝不标 SKIP 永久跳过
             time.sleep(wait_s)
             continue
         if is_rejection_text(result):
             cli_print(f"[analyst] 第 {i+1} 批被风控拒(第{attempt+1}/3次)：{result.strip()[:60]}")
+            last_fail = "rejection"  # 风控拒绝是确定性的(源文该段触发)
             time.sleep(min(5 * (attempt + 1), 20) + random.uniform(0, 3))
             continue
         ok = True
@@ -1271,10 +1274,16 @@ def _run_one_map_batch(i: int, batch: str, map_prompt: str, batch_budget: int, t
     if ok:
         write_text(out_path, stamp_fingerprint(result, batch_budget))
         return "done"
-    # 拒绝是确定性的(源文该段触发),不无限重试:标记 SKIP 不喂归并
-    write_text(out_path, "<<SKIP: 本批被内容风控拒绝，已跳过，不参与归并>>")
-    cli_print(f"[analyst] 第 {i+1} 批三次失败/被拒,已标记跳过。")
-    return "rejected"
+    if last_fail == "rejection":
+        # 风控拒绝是确定性的(源文该段触发),重试也没用:标记 SKIP 不喂归并、续跑不再重试。
+        write_text(out_path, "<<SKIP: 本批被内容风控拒绝，已跳过，不参与归并>>")
+        cli_print(f"[analyst] 第 {i+1} 批三次被风控拒,已标记 SKIP。")
+        return "rejected"
+    # 异常类失败(401认证/网络/超时):临时故障,重试(修好后)能过。绝不写 SKIP——
+    # 否则临时故障会被当永久跳过、续跑不再重试,造成永久数据丢失(如 401 时全批静默丢)。
+    # 不落盘 → 上层完整性校验会把它当缺失批,提示重跑;修好 env/网络后续跑自动补齐。
+    cli_print(f"[analyst] 第 {i+1} 批三次调用异常(非风控,临时故障),不落盘,等重跑补齐。")
+    return "error"
 
 
 def run_analyst(run_cfg: Dict[str, Any], dry_run: bool) -> None:
@@ -1318,12 +1327,24 @@ def run_analyst(run_cfg: Dict[str, Any], dry_run: bool) -> None:
     # 把每批 MAP 切成两段:手法观察(禁真名,喂 prose reduce→写手)、结构台账(含真名,喂 structure reduce)。
     observations = []   # 仅手法观察段
     structure_logs = [] # 仅结构台账段
+    skipped_batches = []  # 被风控故意标 SKIP 的批(合理跳过)
+    missing_batches = []  # 既无有效产物也无 SKIP 标记的批(异常:计数与落盘脱钩)
     for i in range(len(batches)):
         p = analyst_batch_path(i)
         if not p.exists():
+            missing_batches.append(i)
             continue
         content = read_text(p).strip()
-        if not content or content.startswith("<<SKIP") or is_rejection_text(content):
+        if content.startswith("<<SKIP"):
+            skipped_batches.append(i)
+            continue
+        if not content or is_rejection_text(content):
+            # 落了拒绝语却没标 SKIP,或空文件:都算异常缺失,不能静默当合理跳过。
+            missing_batches.append(i)
+            continue
+        if not fingerprint_ok(content, batch_budget):
+            # 指纹不符(旧格式/旧预算):内容不可信,当缺失处理(应重跑)。
+            missing_batches.append(i)
             continue
         content = strip_fingerprint(content)
         technique, structure = split_map_segments(content)
@@ -1331,6 +1352,24 @@ def run_analyst(run_cfg: Dict[str, Any], dry_run: bool) -> None:
             observations.append(technique)
         if structure:
             structure_logs.append(f"【第{i+1}批】\n{structure}")
+
+    # 完整性校验:绝不静默少归并。MAP 阶段报告"完成N批"但磁盘缺批 = 计数与落盘脱钩的 bug,
+    # 此前会悄悄少喂 REDUCE(如 41 批只归并 38 批、丢全书前 60 章),手法卡/结构校准残缺却无人察觉。
+    if missing_batches:
+        preview = ", ".join(str(b + 1) for b in missing_batches[:15])
+        more = f" 等共 {len(missing_batches)} 批" if len(missing_batches) > 15 else ""
+        cli_print(f"[analyst] ⚠ 完整性校验失败:第 {preview}{more} 缺有效产物(既无产物也无SKIP标记)。")
+        cli_print(f"[analyst]   总批数 {len(batches)},有效 {len(observations)},风控跳过 {len(skipped_batches)},缺失 {len(missing_batches)}。")
+        allow_partial = bool((run_cfg.get("analyst") or {}).get("allow_partial_reduce"))
+        if not allow_partial:
+            cli_print("[analyst] 拒绝在缺批情况下归并(会产出残缺手法卡/结构校准)。")
+            cli_print("[analyst] 请重跑 --analyst 补齐缺失批(指纹/SKIP 续跑会自动跳过已完成批),或在 run.json")
+            cli_print("[analyst]   设 analyst.allow_partial_reduce=true 明确允许残缺归并(不建议)。")
+            return
+        cli_print("[analyst] allow_partial_reduce=true:明确允许残缺归并,继续。")
+    else:
+        cli_print(f"[analyst] 完整性校验通过:{len(batches)} 批全部有效产物或合理SKIP(有效 {len(observations)},风控跳过 {len(skipped_batches)})。")
+
     if not observations and not structure_logs:
         cli_print("[analyst] 没有可归并的 MAP 结果。")
         return
@@ -1368,14 +1407,18 @@ def run_map_phase(batches: List[str], map_prompt: str, batch_budget: int,
        ③ 键盘 p/q 由本(主)线程在调度循环里轮询,worker 只查文件,无多线程抢键盘。"""
     concurrency = max(1, int(concurrency))
     total = len(batches)
-    done = rejected = 0
+    done = rejected = errored = 0
 
     def tally(status: str) -> None:
-        nonlocal done, rejected
+        nonlocal done, rejected, errored
         if status in ("done", "skipped_done"):
             done += 1
         elif status in ("rejected", "skipped_rejected"):
             rejected += 1
+        elif status == "error":
+            # 临时故障(401/网络/超时):不落盘、不算完成、不算跳过。单独计数,
+            # 让进度显示如实暴露"有批没成",由 REDUCE 前的完整性校验拦截。
+            errored += 1
 
     # 待跑队列:已存在有效指纹/SKIP 的批 worker 会秒返回(skipped_*),不真调 API。
     pending = list(range(total))
@@ -1432,8 +1475,9 @@ def run_map_phase(batches: List[str], map_prompt: str, batch_budget: int,
                 else:
                     tally(status)
             if finished:  # 仅在有批真正完成时才打进度,避免退避等待期每 2s 刷屏
-                spent = done + rejected
-                cli_print(f"[analyst] 进度 {spent}/{total}（完成 {done}，跳过 {rejected}，在飞 {len(in_flight)}）")
+                spent = done + rejected + errored
+                err_note = f"，失败 {errored}" if errored else ""
+                cli_print(f"[analyst] 进度 {spent}/{total}（完成 {done}，跳过 {rejected}{err_note}，在飞 {len(in_flight)}）")
         if stopping:
             # 等在飞的批自然跑完落盘(它们内部也查 STOP,会尽快收尾),不强杀
             for fut in as_completed_safe(in_flight):

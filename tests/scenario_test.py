@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import importlib
+import os
 import sys
 import threading
 import time
@@ -1136,6 +1137,41 @@ def run(h: TestHarness) -> None:
             if rp.STOP_FILE.exists():
                 rp.STOP_FILE.unlink()
 
+        # (d) 临时故障(401/网络)三次 → 返回 "error",绝不写 SKIP,不算 done。
+        #     根因:401 等临时故障曾被当确定性风控拒绝写 SKIP 永久跳过,造成永久数据丢失。
+        for i in range(8):
+            p = rp.analyst_batch_path(i)
+            if p.exists():
+                p.unlink()
+
+        def fake_401(role, instr, inp, max_out, timeout):
+            raise RuntimeError("HTTP 401 https://x/v1/chat/completions")
+
+        rp.call_model = fake_401
+        orig_sleep = rp.time.sleep
+        rp.time.sleep = lambda *a, **k: None
+        try:
+            status = rp._run_one_map_batch(0, "b0 normal", "MP", 60000, 5)
+            h.equal("临时故障返回error而非rejected", status, "error")
+            h.check("临时故障绝不落盘SKIP", not rp.analyst_batch_path(0).exists(), "")
+        finally:
+            rp.call_model = orig
+            rp.time.sleep = orig_sleep
+
+        # (e) 风控拒绝三次 → 仍写 SKIP(确定性失败,该跳过),与临时故障区分开
+        def fake_reject(role, instr, inp, max_out, timeout):
+            return "the request was rejected because it was considered high risk"
+
+        rp.call_model = fake_reject
+        rp.time.sleep = lambda *a, **k: None
+        try:
+            status = rp._run_one_map_batch(1, "b1 normal", "MP", 60000, 5)
+            h.equal("风控拒绝返回rejected", status, "rejected")
+            h.check("风控拒绝写SKIP", rp.analyst_batch_path(1).read_text(encoding="utf-8").startswith("<<SKIP"), "")
+        finally:
+            rp.call_model = orig
+            rp.time.sleep = orig_sleep
+
     h.section("scenario: gate '第X章' 标题行豁免、正文内仍阻断")
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)
@@ -1583,3 +1619,45 @@ def run(h: TestHarness) -> None:
         h.check("recent_expectation_tail 有界(200块<4k tok)", exp_tok < 4000, f"{exp_tok} tok")
         h.includes("期待账本保留最近增量块", exp, "第200章自动更新")
         h.not_includes("期待账本不含远古增量块", exp, "第001章自动更新")
+
+    h.section("scenario: 清除小说脚本——清写手摘要/章节产物，但绝不碰全量分析")
+    import subprocess
+    with isolated_workspace() as tmp:
+        # 造章节级动态产物 + 全量分析产物,跑清理脚本后验证:章节产物清空、analyst 原样保留
+        (tmp / "runtime" / "summaries").mkdir(parents=True, exist_ok=True)
+        (tmp / "runtime" / "analyst").mkdir(parents=True, exist_ok=True)
+        (tmp / "beats").mkdir(parents=True, exist_ok=True)
+        (tmp / "卷纲").mkdir(parents=True, exist_ok=True)
+        (tmp / "台账版本").mkdir(parents=True, exist_ok=True)
+        (tmp / "chunks").mkdir(parents=True, exist_ok=True)
+        _write(tmp / "runtime" / "summaries" / "chapter_001.json", '{"chapter":1}')
+        _write(tmp / "runtime" / "summaries" / "chapter_113.json", '{"chapter":113}')
+        _write(tmp / "runtime" / "run_3ch.log", "old log")
+        _write(tmp / "runtime" / "ledger.json", "{}")
+        _write(tmp / "beats" / "第002章.json", "{}")
+        _write(tmp / "卷纲" / "10-卷纲.md", "第一卷")
+        # 全量分析产物:绝不能被清小说脚本碰
+        _write(tmp / "runtime" / "analyst" / "map_0000.md", "MAP batch 0")
+        _write(tmp / "runtime" / "analyst" / "_structure_calibration.md", "结构报告")
+        _write(tmp / "chunks" / "chunk_三线交织.md", "手法卡内容")
+
+        script = Path(__file__).resolve().parents[1] / "scripts" / "clean_chapter_artifacts.py"
+        env = dict(os.environ)
+        env["NOVEL_WORKSPACE"] = str(tmp)
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(tmp), env=env, input="", capture_output=True, text=True, timeout=60,
+        )
+        h.check("清理脚本退出码0", proc.returncode == 0, proc.stderr[-300:])
+        # 章节级动态产物:清空
+        h.check("写手摘要被清(新章)", not (tmp / "runtime" / "summaries" / "chapter_001.json").exists(), "")
+        h.check("写手摘要被清(旧残留章)", not (tmp / "runtime" / "summaries" / "chapter_113.json").exists(), "")
+        h.check("残留日志被清", not (tmp / "runtime" / "run_3ch.log").exists(), "")
+        h.check("章节台账被清", not (tmp / "runtime" / "ledger.json").exists(), "")
+        h.check("beats被清", not (tmp / "beats" / "第002章.json").exists(), "")
+        h.check("卷纲被清", not (tmp / "卷纲" / "10-卷纲.md").exists(), "")
+        # 全量分析产物:原样保留(两个脚本各干各的)
+        h.check("analyst MAP 保留(清小说不碰分析)", (tmp / "runtime" / "analyst" / "map_0000.md").exists(), "")
+        h.check("analyst 结构报告保留", (tmp / "runtime" / "analyst" / "_structure_calibration.md").exists(), "")
+        h.check("手法卡chunk保留", (tmp / "chunks" / "chunk_三线交织.md").exists(), "")

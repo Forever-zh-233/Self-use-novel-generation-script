@@ -108,6 +108,8 @@ def merge_state_update(update: Dict[str, Any]) -> None:
         table = threads.setdefault("foreshadowing", {})
         for item in foreshadowing.get("upsert") or []:
             if isinstance(item, dict) and item.get("id"):
+                if chapter_no and not item.get("last_advanced"):
+                    item["last_advanced"] = int(chapter_no)
                 table[str(item["id"])] = item
         for item in foreshadowing.get("resolve") or []:
             if isinstance(item, dict) and item.get("id"):

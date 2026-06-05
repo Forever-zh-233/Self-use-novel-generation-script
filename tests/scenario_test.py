@@ -910,6 +910,58 @@ def run(h: TestHarness) -> None:
         secrets2 = ledger2["entities"]["周通"].get("secrets") or []
         h.check("重复 ingest 不重复写 secrets", len(secrets2) == len(zt.get("secrets") or []), f"first={len(zt.get('secrets',[]))}, second={len(secrets2)}")
 
+    h.section("scenario: 任务4 伏笔Progress预警(foreshadowing_progress_digest)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        core, api, state, context, gates, archivist_mod = _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        importlib.reload(planning)
+        # F-001:last_advanced=1,当前章51,gap=50→超阈值8,strength=大
+        # F-002:last_advanced=48,当前章51,gap=3→未达阈值
+        # F-003:无last_advanced→不误报
+        _write_json(tmp / "runtime/active_threads.json", {
+            "foreshadowing": {
+                "F-001": {"id": "F-001", "type": "解谜/身世", "planted_chapter": 1,
+                          "strength": "大", "status": "未回收", "promise": "原主是谁",
+                          "last_advanced": 1},
+                "F-002": {"id": "F-002", "type": "悬念/道具", "planted_chapter": 3,
+                          "strength": "中", "status": "未回收", "promise": "铜片来历",
+                          "last_advanced": 48},
+                "F-003": {"id": "F-003", "type": "悬念/事件", "planted_chapter": 5,
+                          "strength": "中", "status": "未回收", "promise": "哭声来源"},
+            },
+            "open_questions": [], "next_id": "F-004",
+        })
+        digest = planning.foreshadowing_progress_digest(51, stale_threshold=8)
+        h.includes("F-001 被点名(gap=50)", digest, "F-001")
+        h.not_includes("F-002 未到阈值不报(gap=3)", digest, "F-002")
+        h.not_includes("F-003 无last_advanced不误报", digest, "F-003")
+        # archivist upsert 自动打 last_advanced
+        import importlib as _il
+        arc_mod = _il.import_module("pipeline.archivist")
+        _il.reload(arc_mod)
+        _write_json(tmp / "runtime/state.json", {"latest_chapter": 10})
+        update = {
+            "_chapter": 10,
+            "foreshadowing": {
+                "upsert": [{"id": "F-NEW", "type": "悬念/事件", "strength": "中",
+                            "status": "未回收", "promise": "新伏笔"}]
+            }
+        }
+        arc_mod.merge_state_update(update)
+        threads_after = json.loads((tmp / "runtime/active_threads.json").read_text(encoding="utf-8"))
+        new_entry = threads_after["foreshadowing"].get("F-NEW", {})
+        h.check("archivist upsert 自动打 last_advanced=10", new_entry.get("last_advanced") == 10, str(new_entry.get("last_advanced")))
+
+    h.section("scenario: 任务5 story_director 世界重量维度(prompt文本验证)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _write(tmp / "prompts/story_director.md", open("prompts/story_director.md", encoding="utf-8").read())
+        director_prompt = (tmp / "prompts/story_director.md").read_text(encoding="utf-8")
+        h.includes("第10维度:世界重量存在", director_prompt, "世界重量")
+        h.includes("世界重量是软提示非KPI", director_prompt, "软提示")
+        h.includes("连续N章无生命危险触发条件", director_prompt, "生命危险")
+
     h.section("scenario: 场景装置去重(recent_scene_devices_digest)抓跨章同招")
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)

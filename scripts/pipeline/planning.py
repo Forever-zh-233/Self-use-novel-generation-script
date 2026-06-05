@@ -160,6 +160,10 @@ def threads_digest_for_director(chapter: int) -> str:
     obs_digest = obligations_due_digest(chapter)
     if obs_digest:
         lines.append("\n" + obs_digest)
+    # 伏笔 Progress 预警(Sanderson:承诺没进展=读者弃书首因)
+    fp_digest = foreshadowing_progress_digest(chapter)
+    if fp_digest:
+        lines.append("\n" + fp_digest)
     return "\n".join(lines).strip()
 
 
@@ -508,6 +512,37 @@ def overdue_foreshadowing_digest(chapter: int, long_term_only: bool = False) -> 
     lines.append("回收要求：(1)回报值得等待 (2)有代价 (3)方式出乎意料。")
     lines.append("标「估算窗口」的伏笔尚无明确回收章,若本弧不收,请为它写一个 resolve_by 章号。")
     lines.append("如果判断当前剧情确实不适合回收，必须写明延期理由并给出新 deadline——不能无视。")
+    return "\n".join(lines)
+
+
+def foreshadowing_progress_digest(chapter: int, stale_threshold: int = 8) -> str:
+    """Sanderson Progress 预警:伏笔连续 N 章无推进(last_advanced 过老)即报警。
+    复用 T-XXX 的 threads_digest_for_director 模式，让规划层知道哪些承诺读者快忘了。
+    只报 strength=大/中 且未回收的伏笔，小伏笔噪音太多不列。"""
+    threads = load_active_threads()
+    foreshadowing = threads.get("foreshadowing") or {}
+    stale = []
+    for fid, item in foreshadowing.items():
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") in ("已回收", "已结") or item.get("resolved_chapter"):
+            continue
+        if str(item.get("strength", "")) not in ("大", "中"):
+            continue
+        last = item.get("last_advanced")
+        if last is None:
+            continue  # 历史遗留无 last_advanced，不误报
+        gap = chapter - int(last)
+        if gap >= stale_threshold:
+            stale.append((fid, item, gap))
+    if not stale:
+        return ""
+    stale.sort(key=lambda x: -x[2])
+    lines = [f"📭 伏笔 Progress 预警（连续≥{stale_threshold}章无推进，读者承诺正在消退）："]
+    for fid, item, gap in stale[:10]:
+        desc = item.get("promise") or item.get("type") or fid
+        lines.append(f"- [{fid}] {desc} — 已{gap}章未推进（埋设第{item.get('planted_chapter','?')}章）")
+    lines.append("建议：在本弧某章让它侧面露个面、推进一小步——不必解决，只要让读者知道它还在。")
     return "\n".join(lines)
 
 
@@ -938,6 +973,14 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int,
             "⚠ 过期/临期伏笔警告（必须在本弧线安排回收）",
             overdue_text,
             "critical", False,
+        ))
+    # 伏笔 Progress 预警(Sanderson:承诺没进展=读者弃书首因)
+    fp_text = foreshadowing_progress_digest(chapter)
+    if fp_text:
+        sections.append(make_section(
+            "📭 伏笔 Progress 预警（久未推进的承诺）",
+            fp_text,
+            "high", True,
         ))
     # 影响种子（POV 章候选）
     seeds_text = impact_seeds_digest(chapter)

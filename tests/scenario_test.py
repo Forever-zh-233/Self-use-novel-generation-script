@@ -760,6 +760,156 @@ def run(h: TestHarness) -> None:
         h.not_includes("无逐章走向时不注入格子行", out_legacy, "本章走向格子")
         h.includes("仍保留段落走向", out_legacy, "改用笨办法")
 
+    h.section("scenario: 伏笔回收断链修复(resolve_by 回写 + 隐式 deadline 兜底)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        core, api, state, context, gates, archivist = _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        importlib.reload(planning)
+        # 三类窗口配置(隐式 deadline 推算依赖)
+        _write_json(tmp / "config/structure_norms.json", {
+            "伏笔回收窗口章数": {
+                "任务即时类(委托/危机/小疑问)": [1, 6],
+                "关系成长类": [7, 16],
+                "信物命运级": [30, 50],
+            },
+        })
+        # 账本:F-100 无 deadline(将被 arc 回写)、F-101 无 deadline 老伏笔(走隐式)、F-102 已有 deadline 不许覆盖
+        _write_json(tmp / "runtime/active_threads.json", {
+            "foreshadowing": {
+                "F-100": {"id": "F-100", "type": "悬念/道具", "planted_chapter": 5,
+                          "strength": "中", "status": "未回收", "promise": "铜片来历"},
+                "F-101": {"id": "F-101", "type": "解谜/身世", "planted_chapter": 1,
+                          "strength": "大", "status": "未回收", "promise": "原主是谁"},
+                "F-102": {"id": "F-102", "type": "悬念/事件", "planted_chapter": 3,
+                          "strength": "中", "status": "未回收", "promise": "哭声来源",
+                          "planned_resolution": "20"},
+            },
+            "open_questions": [], "next_id": "F-103",
+        })
+        # arc_planner 产出:为 F-100 规划 resolve_by=30,为 F-102 也给(应被既有值保护)
+        arcs = [{
+            "arc_id": "ARC-FX", "title": "铜片溯源", "type": "副线",
+            "span": [25, 35], "summary": "查铜片",
+            "resolution_condition": "查清铜片",
+            "nodes": [
+                {"chapter": 25, "beat_hint": "埋", "tension": "中",
+                 "narrative_ops": {"foreshadowing": [
+                     {"op": "埋", "id": "F-100", "resolve_by": 30, "resolve_hint": "药铺认出同款铜片"},
+                     {"op": "埋", "id": "F-102", "resolve_by": 99},
+                 ]}},
+                {"chapter": 35, "beat_hint": "收", "tension": "高"},
+            ],
+        }]
+        n = planning._backfill_resolve_by_to_threads(arcs)
+        threads = json.loads((tmp / "runtime" / "active_threads.json").read_text(encoding="utf-8"))
+        fs = threads["foreshadowing"]
+        h.check("回写条数=1(只 F-100,F-102 被既有值保护)", n == 1, f"n={n}")
+        h.check("F-100 拿到 planned_resolution=30", str(fs["F-100"].get("planned_resolution")) == "30", str(fs["F-100"].get("planned_resolution")))
+        h.includes("F-100 回收方向落进 notes", fs["F-100"].get("notes", ""), "药铺认出同款铜片")
+        h.check("F-102 既有 deadline 不被覆盖(仍=20)", str(fs["F-102"].get("planned_resolution")) == "20", str(fs["F-102"].get("planned_resolution")))
+        # 隐式 deadline:F-101 身世/大 → 埋1+窗口上界50=51;第60章应判过期
+        h.check("F-101 身世大 → 信物命运级窗口", planning._foreshadowing_window_key(fs["F-101"]) == "信物命运级", "")
+        h.check("F-101 隐式 deadline=51", planning._implicit_deadline(fs["F-101"]) == 51, str(planning._implicit_deadline(fs["F-101"])))
+        digest = planning.overdue_foreshadowing_digest(60)
+        h.includes("第60章追债器点名 F-100(回写后生效)", digest, "F-100")
+        h.includes("第60章追债器点名 F-101(隐式窗口生效)", digest, "F-101")
+        h.includes("隐式窗口条目标注估算", digest, "估算窗口")
+        h.not_includes("既有空转 bug 不再发生(digest 非空)", digest, "@@NEVER@@")
+
+    h.section("scenario: 主线弧缺失修复(needs_arc_planning 缺主线也触发 + 补线合并不冲副线)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        core, api, state, context, gates, archivist = _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        importlib.reload(planning)
+        # 只有一条副线,主线缺失 → needs_arc_planning 应返回 True
+        side_only = [{"arc_id": "ARC-S1", "type": "副线", "title": "副线A",
+                      "span": [49, 68], "summary": "消化遗物",
+                      "resolution_condition": "查清",
+                      "nodes": [{"chapter": 60, "beat_hint": "推进", "tension": "中"},
+                                {"chapter": 68, "beat_hint": "收", "tension": "高"}]}]
+        planning.save_active_arcs(side_only)
+        h.check("只有副线时 needs_arc_planning=True(缺主线)", planning.needs_arc_planning(50), "")
+        h.check("has_active_mainline 返回 False", not planning.has_active_mainline(side_only), "")
+        # 1主1副时不触发
+        with_main = side_only + [{"arc_id": "ARC-M1", "type": "主线推进", "title": "主线",
+                                   "span": [50, 70], "summary": "危机",
+                                   "resolution_condition": "解危",
+                                   "nodes": [{"chapter": 70, "beat_hint": "收", "tension": "高潮"}]}]
+        planning.save_active_arcs(with_main)
+        h.check("1主1副时 needs_arc_planning=False", not planning.needs_arc_planning(50), "")
+        h.check("has_active_mainline 返回 True", planning.has_active_mainline(with_main), "")
+        # 补线合并逻辑:_backfill 之前,验证 augment 输入构造时不崩溃
+        build_ok = True
+        try:
+            _ = planning.build_arc_input(50, {
+                "max_input_tokens": {"arc_planner": 200000, "compressor": 200000},
+                "context_windows": {"arc_planner": 200000, "compressor": 200000},
+                "compress_at_ratio": 1,
+            }, timeout=1, augment_live_arcs=side_only)
+        except Exception:
+            build_ok = False
+        h.check("补线模式 build_arc_input 不崩溃", build_ok, "")
+        # 补线合并:新主线 + 原副线 = 2条,副线 arc_id 必须保留
+        new_main = [{"arc_id": "ARC-NEW", "type": "主线推进", "title": "新主线",
+                     "span": [50, 65], "summary": "新危机",
+                     "resolution_condition": "解危",
+                     "nodes": [{"chapter": 65, "beat_hint": "收", "tension": "高潮"}]}]
+        planning.save_active_arcs(side_only)  # 先还原只有副线
+        existing_ids = {a.get("arc_id") for a in side_only}
+        merged = side_only + [a for a in new_main if a.get("arc_id") not in existing_ids]
+        planning.save_active_arcs(merged)
+        loaded = planning.load_active_arcs()
+        h.check("合并后共2条弧线", len(loaded) == 2, str(len(loaded)))
+        h.check("副线 arc_id 保留", any(a.get("arc_id") == "ARC-S1" for a in loaded), "")
+        h.check("新主线 arc_id 存在", any(a.get("arc_id") == "ARC-NEW" for a in loaded), "")
+        h.check("合并后 has_active_mainline=True", planning.has_active_mainline(loaded), "")
+
+    h.section("scenario: 配角消费端(_ingest_side_characters 落 ledger + beat_moments 消费)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        core, api, state, context, gates, archivist = _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        importlib.reload(planning)
+        # 构造带 side_characters 的弧线
+        arcs = [{
+            "arc_id": "ARC-SC1", "type": "副线", "title": "周通的秘密",
+            "span": [9, 30], "resolution_condition": "揭秘",
+            "nodes": [{"chapter": 13, "beat_hint": "周通支开沈安", "tension": "中",
+                       "narrative_ops": {"foreshadowing": []}}],
+            "side_characters": [{
+                "name": "周通",
+                "independent_goal": "守住亡妻的坟不让外人靠近",
+                "hidden_agenda": "知道井下有东西但不想让人发现",
+                "knowledge_boundary": "知道沈安来历不明,不知道他是盲人",
+                "beat_moments": [{"ch": 13, "what": "支开沈安，用借口挡住追问"}],
+            }],
+        }]
+        n = planning._ingest_side_characters(arcs)
+        ledger = json.loads((tmp / "runtime" / "ledger.json").read_text(encoding="utf-8"))
+        entities = ledger.get("entities", {})
+        h.check("ingest 返回非零", n > 0, f"n={n}")
+        h.check("周通实体已建", "周通" in entities, "")
+        zt = entities.get("周通", {})
+        h.check("independent_goal → arc_core.want", "守住亡妻" in (zt.get("arc_core") or {}).get("want", ""), "")
+        secrets_texts = [s.get("secret", "") if isinstance(s, dict) else str(s) for s in (zt.get("secrets") or [])]
+        h.check("hidden_agenda → secrets", any("井下" in s for s in secrets_texts), "")
+        facts_texts = zt.get("facts") or []
+        h.check("knowledge_boundary → facts", any("盲人" in f for f in facts_texts), "")
+        bm = (zt.get("arc_core") or {}).get("beat_moments") or []
+        h.check("beat_moments 落进 arc_core", any(m.get("ch") == 13 for m in bm if isinstance(m, dict)), "")
+        # beat_moments 消费端:第13章应有提示
+        hint_13 = planning._beat_moments_for_chapter(13)
+        h.includes("第13章 beat_moments 消费端有周通提示", hint_13, "周通")
+        hint_14 = planning._beat_moments_for_chapter(14)
+        h.check("第14章无 beat_moments(不误报)", hint_14 == "", hint_14[:40] if hint_14 else "")
+        # 重复 ingest 不产生重复 secrets
+        n2 = planning._ingest_side_characters(arcs)
+        ledger2 = json.loads((tmp / "runtime" / "ledger.json").read_text(encoding="utf-8"))
+        secrets2 = ledger2["entities"]["周通"].get("secrets") or []
+        h.check("重复 ingest 不重复写 secrets", len(secrets2) == len(zt.get("secrets") or []), f"first={len(zt.get('secrets',[]))}, second={len(secrets2)}")
+
     h.section("scenario: 场景装置去重(recent_scene_devices_digest)抓跨章同招")
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)

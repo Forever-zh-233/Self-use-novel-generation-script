@@ -13,6 +13,7 @@ from pipeline.core import (
     BASE_DIR, OUTPUT_DIR, PROMPTS_DIR, RUNTIME_DIR,
     LEDGER_MD_FILE, MASTER_OUTLINE_FILE, VOLUME_PLAN_FILE, VERSION_DIR,
     LONG_FORESHADOWING_FILE, VOLUME_DIGESTS_FILE, CLIMAX_TENSIONS,
+    ACTIVE_THREADS_FILE, LEDGER_FILE,
     cli_print, dump_json, load_json, manuscript_path, read_text,
     role_artifact, write_text, extract_json_object,
 )
@@ -470,13 +471,20 @@ def overdue_foreshadowing_digest(chapter: int, long_term_only: bool = False) -> 
             continue
         planned = item.get("planned_resolution") or ""
         deadline_match = re.search(r"(\d+)", str(planned))
-        if not deadline_match:
-            continue
-        deadline = int(deadline_match.group(1))
+        if deadline_match:
+            deadline = int(deadline_match.group(1))
+            estimated = False
+        else:
+            # 兜底:没有规划 deadline 的历史遗留伏笔,按类型回收窗口推算隐式 deadline,
+            # 使其也能被点名催收,而不是永远静默堆债。
+            deadline = _implicit_deadline(item)
+            if deadline is None:
+                continue
+            estimated = True
         if chapter > deadline:
-            overdue.append((fid, item, chapter - deadline))
+            overdue.append((fid, item, chapter - deadline, estimated))
         elif chapter >= deadline - 3:
-            due_soon.append((fid, item, deadline - chapter))
+            due_soon.append((fid, item, deadline - chapter, estimated))
 
     if not overdue and not due_soon:
         return ""
@@ -485,17 +493,20 @@ def overdue_foreshadowing_digest(chapter: int, long_term_only: bool = False) -> 
     lines = []
     if overdue:
         lines.append(f"⚠ 已过期未回收的伏笔（{scope}，必须安排回收）：")
-        for fid, item, gap in sorted(overdue, key=lambda x: -x[2]):
+        for fid, item, gap, estimated in sorted(overdue, key=lambda x: -x[2]):
             desc = item.get("promise") or item.get("type") or fid
-            lines.append(f"- [{fid}] {desc} — 过期{gap}章（埋设第{item.get('planted_chapter', '?')}章）")
+            est = "·估算窗口" if estimated else ""
+            lines.append(f"- [{fid}] {desc} — 过期{gap}章（埋设第{item.get('planted_chapter', '?')}章{est}）")
     if due_soon:
         lines.append(f"⏰ 即将到期的伏笔（{scope}，本弧线/本卷内安排回收）：")
-        for fid, item, remain in due_soon:
+        for fid, item, remain, estimated in due_soon:
             desc = item.get("promise") or item.get("type") or fid
-            lines.append(f"- [{fid}] {desc} — 还剩{remain}章")
+            est = "·估算窗口" if estimated else ""
+            lines.append(f"- [{fid}] {desc} — 还剩{remain}章{est}")
 
     lines.append("")
     lines.append("回收要求：(1)回报值得等待 (2)有代价 (3)方式出乎意料。")
+    lines.append("标「估算窗口」的伏笔尚无明确回收章,若本弧不收,请为它写一个 resolve_by 章号。")
     lines.append("如果判断当前剧情确实不适合回收，必须写明延期理由并给出新 deadline——不能无视。")
     return "\n".join(lines)
 
@@ -643,13 +654,36 @@ def in_climax_window(chapter: int, window: int = 1) -> bool:
     return False
 
 
+def _arc_is_mainline(arc: Dict[str, Any]) -> bool:
+    """判断一条弧线是不是主线。type 含'主'(主线/主线推进)即算主线。"""
+    return "主" in str(arc.get("type", ""))
+
+
+def has_active_mainline(arcs: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """当前活跃弧线里有没有一条主线弧(尚未走完的)。
+    走完判据:弧线最后一个节点章 <= 已无意义,这里只看 type,
+    needs_arc_planning 另行处理'即将用完'。"""
+    if arcs is None:
+        arcs = load_active_arcs()
+    return any(_arc_is_mainline(a) for a in arcs)
+
+
 def needs_arc_planning(chapter: int) -> bool:
     """判断是否需要调用弧线规划师:
     - 没有活跃弧线(首次或全部收束)
-    - 所有活跃弧线的最后一个节点 <= 当前章+1(即将用完)"""
+    - 所有活跃弧线的最后一个节点 <= 当前章+1(即将用完)
+    - 缺主线弧:活跃弧线全是副线,主线断档(否则副线会独撑很多章,主角无大事、全注水)"""
     arcs = load_active_arcs()
     if not arcs:
         return True
+    # 缺主线:有弧线但没有一条主线,且现存主线/副线还没即将用完时也要补
+    if not has_active_mainline(arcs):
+        # 只要还有未走完的弧线撑着(不会立刻触发下面的"即将用完"分支),
+        # 缺主线本身就该补一条主线,不能让副线独撑
+        for arc in arcs:
+            nodes = arc.get("nodes") or []
+            if nodes and max(n.get("chapter", 0) for n in nodes) > chapter + 1:
+                return True
     for arc in arcs:
         nodes = arc.get("nodes") or []
         if nodes:
@@ -855,7 +889,8 @@ def structure_norms_digest(scope: str = "arc") -> str:
     return body if len(lines) > 1 else ""
 
 
-def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
+def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int,
+                    augment_live_arcs: Optional[List[Dict[str, Any]]] = None) -> str:
     growth_file = BASE_DIR / "config" / "growth_arcs.md"
     growth_text = read_text(growth_file) if growth_file.exists() else ""
     sections = [
@@ -871,6 +906,21 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
         make_section("长线伏笔进度表(本弧该顺手推进哪几条)", long_foreshadowing_progress(chapter), "high", False),
         make_section("最近章节 beat 回顾", recent_beats_summary(chapter), "normal", True),
     ]
+    # 缺主线·补线模式:把仍在进行的副线告诉规划师,要求只补一条互补的主线,别重复副线已在办的事
+    if augment_live_arcs:
+        live_brief = []
+        for a in augment_live_arcs:
+            nodes = a.get("nodes") or []
+            last_ch = max((n.get("chapter", 0) for n in nodes), default="?")
+            live_brief.append(f"- [{a.get('arc_id','?')}|{a.get('type','?')}] {a.get('title','?')}(span {a.get('span','?')},走到第{last_ch}章):{a.get('summary','')[:60]}")
+        sections.insert(2, make_section(
+            "⚠ 当前缺主线弧(必须补一条主线)",
+            "现在只有副线在撑场,主角缺少贯穿性的大事/主线推进,故事会显得注水。\n"
+            "本次**只产出 1 条主线弧**(type 含'主线'),与下面仍在进行的副线**互补而非重复**——"
+            "副线在办的事别再开一遍,主线要给主角一件够分量、能推几章到爆发的大事(危机/对抗/修炼突破/命运推进皆可)。\n"
+            "仍在进行的副线(保留,你别动它们):\n" + "\n".join(live_brief),
+            "critical", False,
+        ))
     if growth_text:
         sections.append(make_section("角色成长轨迹(规划弧线时标注本弧的成长阶段和心态变化)", growth_text, "high", True))
     # 本书结构参考分布(项目三 D:数字与原理分离,原理在 arc_planner.md,数字在 config/structure_norms.json)
@@ -932,11 +982,145 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
     return compress_sections_if_needed("arc_planner", chapter, sections, run_cfg, timeout)
 
 
+# 伏笔类型 → 回收窗口键(config/structure_norms.json 的「伏笔回收窗口章数」三档)
+def _foreshadowing_window_key(item: Dict[str, Any]) -> str:
+    """按伏笔的 type/strength 判定它属于哪一类回收窗口。
+    信物命运级(身世/身份/命运/系统/记忆 或 strength=大)拖得久;
+    关系成长类(情感/关系/角色/成长)中等;其余(悬念/谜团/道具/事件/细节)收得快。"""
+    type_text = str(item.get("type", ""))
+    if any(k in type_text for k in ("身世", "身份", "命运", "系统", "记忆", "异象")):
+        return "信物命运级"
+    if str(item.get("strength", "")) == "大":
+        return "信物命运级"
+    if any(k in type_text for k in ("情感", "关系", "角色", "成长", "托付")):
+        return "关系成长类"
+    return "任务即时类(委托/危机/小疑问)"
+
+
+def _implicit_deadline(item: Dict[str, Any]) -> Optional[int]:
+    """给没有 planned_resolution 的历史遗留伏笔推算一个隐式 deadline。
+    取「埋设章 + 该类型回收窗口上界」,只用于过期预警排序,不写回文件。
+    这样 138 条没 deadline 的老伏笔也能被点名,而不是永远静默堆债。"""
+    planted = item.get("planted_chapter")
+    if not isinstance(planted, int):
+        try:
+            planted = int(planted)
+        except (TypeError, ValueError):
+            return None
+    norms = load_json(BASE_DIR / "config" / "structure_norms.json")
+    windows = norms.get("伏笔回收窗口章数") or {}
+    win = windows.get(_foreshadowing_window_key(item))
+    if not (isinstance(win, list) and len(win) == 2):
+        return None
+    return planted + int(win[1])
+
+
+def _backfill_resolve_by_to_threads(arcs: List[Dict[str, Any]]) -> int:
+    """接断链:把 arc_planner 在节点 narrative_ops.foreshadowing[].resolve_by 规划好的
+    回收章,回写到 active_threads.json 对应 F 条目的 planned_resolution。
+    这样 overdue_foreshadowing_digest 才读得到 deadline,不再结构性空转。
+    已有 planned_resolution 的不覆盖(尊重既有规划)。返回回写条数。"""
+    threads = load_active_threads()
+    table = threads.get("foreshadowing") or {}
+    if not table:
+        return 0
+    changed = 0
+    for arc in arcs:
+        for node in arc.get("nodes") or []:
+            ops = (node.get("narrative_ops") or {}).get("foreshadowing") or []
+            for op in ops:
+                if not isinstance(op, dict):
+                    continue
+                if op.get("op") not in ("埋", "酿"):
+                    continue
+                fid = str(op.get("id") or "")
+                resolve_by = op.get("resolve_by")
+                if not fid or resolve_by in (None, ""):
+                    continue
+                entry = table.get(fid)
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("planned_resolution"):
+                    continue  # 已有规划,不覆盖
+                entry["planned_resolution"] = resolve_by
+                hint = op.get("resolve_hint")
+                if hint:
+                    note = entry.get("notes", "")
+                    tag = f"[回收方向:{hint}]"
+                    if tag not in note:
+                        entry["notes"] = (note + " " + tag).strip()
+                changed += 1
+    if changed:
+        threads["foreshadowing"] = table
+        dump_json(ACTIVE_THREADS_FILE, threads)
+    return changed
+
+
+def _ingest_side_characters(arcs: List[Dict[str, Any]]) -> int:
+    """接断链:把 arc_planner 产出的 side_characters[] 落进 ledger.entities,
+    让 writer/beat_planner 在主角章也能读到配角的隐藏议程和知识边界。
+    - hidden_agenda → secrets 列表追加(已有相同内容不重复)
+    - independent_goal → arc_core.want(不覆盖 archivist 已填的)
+    - knowledge_boundary → facts 追加(短摘要,防全量泄露)
+    - beat_moments 附到 arc_core.beat_moments(beat_planner 消费)
+    不存在的实体自动建最小卡(type=角色)。返回写入条数。"""
+    ledger = load_ledger()
+    entities = ledger.setdefault("entities", {})
+    changed = 0
+    for arc in arcs:
+        for sc in arc.get("side_characters") or []:
+            if not isinstance(sc, dict):
+                continue
+            name = str(sc.get("name") or "").strip()
+            if not name:
+                continue
+            e = entities.setdefault(name, {
+                "type": "角色", "summary": sc.get("independent_goal", "")[:60],
+                "status": "活跃", "facts": [], "secrets": [], "arc_core": {},
+            })
+            # hidden_agenda → secrets
+            agenda = sc.get("hidden_agenda")
+            if agenda:
+                existing = [s.get("secret", "") if isinstance(s, dict) else str(s)
+                            for s in (e.get("secrets") or [])]
+                if agenda not in existing:
+                    e.setdefault("secrets", []).append({"secret": agenda, "known_by": []})
+                    changed += 1
+            # independent_goal → arc_core.want(不覆盖)
+            goal = sc.get("independent_goal")
+            if goal and not (e.get("arc_core") or {}).get("want"):
+                e.setdefault("arc_core", {})["want"] = goal
+                changed += 1
+            # knowledge_boundary → facts(防重复)
+            kb = sc.get("knowledge_boundary")
+            if kb:
+                kb_tag = f"[知识边界] {kb[:80]}"
+                if kb_tag not in (e.get("facts") or []):
+                    e.setdefault("facts", []).append(kb_tag)
+                    changed += 1
+            # beat_moments → arc_core.beat_moments(beat_planner 消费)
+            bm = sc.get("beat_moments")
+            if bm:
+                e.setdefault("arc_core", {})["beat_moments"] = bm
+                changed += 1
+    if changed:
+        ledger["entities"] = entities
+        dump_json(LEDGER_FILE, ledger)
+    return changed
+
+
 def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None:
-    """调用弧线规划师,生成新的短线弧骨架。"""
-    cli_print(f"[arc_planner] 第{chapter}章:需要新弧线,调用弧线规划师…")
+    """调用弧线规划师,生成新的短线弧骨架。
+    补线模式:若当前只有副线(缺主线),把活跃副线告知规划师,要求只补一条主线,
+    新弧线与现有副线合并存盘,不覆盖仍在进行的副线。"""
+    live_arcs = load_active_arcs()
+    augment = live_arcs if (live_arcs and not has_active_mainline(live_arcs)) else None
+    if augment:
+        cli_print(f"[arc_planner] 第{chapter}章:缺主线弧,补线模式启动(保留{len(live_arcs)}条副线)…")
+    else:
+        cli_print(f"[arc_planner] 第{chapter}章:需要新弧线,调用弧线规划师…")
     arc_prompt = read_text(PROMPTS_DIR / "arc_planner.md")
-    arc_input = build_arc_input(chapter, run_cfg, timeout)
+    arc_input = build_arc_input(chapter, run_cfg, timeout, augment_live_arcs=augment)
     if run_cfg.get("dry_run"):
         write_text(RUNTIME_DIR / "arc_planner_dryrun.md", f"<<SYSTEM>>\n{arc_prompt}\n\n<<INPUT>>\n{arc_input}")
         cli_print("[arc_planner] dry-run: prompt 已保存,未调用 API。")
@@ -957,9 +1141,24 @@ def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None
         return
     if not isinstance(arcs, list):
         arcs = [arcs] if isinstance(arcs, dict) else []
-    save_active_arcs(arcs)
-    arc_names = [a.get("title", "?") for a in arcs]
-    cli_print(f"[arc_planner] 生成 {len(arcs)} 条弧线:{', '.join(arc_names)}")
+    # 补线模式:把新主线和原有副线合并,新 arc_id 不与现有冲突才保留
+    if augment:
+        existing_ids = {a.get("arc_id") for a in live_arcs}
+        new_arcs = [a for a in arcs if a.get("arc_id") not in existing_ids]
+        merged = live_arcs + new_arcs
+        save_active_arcs(merged)
+        arcs = new_arcs  # 只对新弧线做后续处理(回写伏笔 deadline)
+        cli_print(f"[arc_planner] 补线模式:保留{len(live_arcs)}条副线 + 新增{len(new_arcs)}条主线。")
+    else:
+        save_active_arcs(arcs)
+    backfilled = _backfill_resolve_by_to_threads(arcs)
+    if backfilled:
+        cli_print(f"[arc_planner] 已回写 {backfilled} 条伏笔回收 deadline 到期待账本(追债器生效)。")
+    ingested = _ingest_side_characters(arcs)
+    if ingested:
+        cli_print(f"[arc_planner] 已沉淀 {ingested} 项配角议程/知识边界到 ledger(writer/beat 可读)。")
+    arc_names = [a.get("title", "?") for a in (load_active_arcs())]
+    cli_print(f"[arc_planner] 当前活跃弧线({len(arc_names)}条):{', '.join(arc_names)}")
 
 
 def active_arcs_for_beat(chapter: int) -> str:
@@ -1055,6 +1254,31 @@ def active_arcs_for_beat(chapter: int) -> str:
     return "\n".join(lines)
 
 
+def _beat_moments_for_chapter(chapter: int) -> str:
+    """从 ledger.entities 的 arc_core.beat_moments 里找本章有安排动作的配角,
+    提示 beat_planner 让该配角基于自身议程做可见动作(不是主角眼里的工具人)。"""
+    ledger = load_ledger()
+    lines = []
+    for name, e in (ledger.get("entities") or {}).items():
+        if e.get("status") in ("退场", "沉睡"):
+            continue
+        bm = (e.get("arc_core") or {}).get("beat_moments")
+        if not isinstance(bm, list):
+            continue
+        for m in bm:
+            if not isinstance(m, dict):
+                continue
+            if int(m.get("ch") or 0) == chapter:
+                goal = (e.get("arc_core") or {}).get("want") or ""
+                agenda_items = [s.get("secret", "") if isinstance(s, dict) else str(s)
+                                for s in (e.get("secrets") or [])[:1]]
+                agenda = agenda_items[0] if agenda_items else ""
+                hint = str(m.get("what") or "")
+                lines.append(f"- {name}（{goal[:40]}）：{hint}"
+                             + (f"  [隐藏议程：{agenda[:50]}]" if agenda else ""))
+    return "\n".join(lines)
+
+
 def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
     sections = [
         make_section("目标章节", f"第{chapter}章", "critical", False),
@@ -1129,6 +1353,14 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
     layout = layout_for_beat({"出场角色": [], "当前地点": load_state().get("current_location", "")})
     if layout:
         sections.append(make_section("当前地点既有布局(安排场景走位时遵守,不要改已确立的方位陈设)", layout, "normal", True))
+    # 配角本章动作:beat_moments 指定章的配角应基于自身议程做可见动作
+    beat_moments_hints = _beat_moments_for_chapter(chapter)
+    if beat_moments_hints:
+        sections.append(make_section(
+            "配角议程·本章动作提示(基于弧线规划的 side_characters.beat_moments)",
+            beat_moments_hints,
+            "high", False,
+        ))
     return compress_sections_if_needed("beat_planner", chapter, sections, run_cfg, timeout)
 
 

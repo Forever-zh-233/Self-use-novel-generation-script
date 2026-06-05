@@ -1110,14 +1110,42 @@ def analyst_batch_path(idx: int) -> Path:
 # 伏笔拼接的钥匙,是项目三头号敌人)。约48批 × 18000 ≈ 86万 ≤ 1M,留足 REDUCE 余量。
 ANALYST_MAP_OUTPUT_TOKENS = 18000
 
-# MAP/merge 落盘产物的格式版本指纹。续跑复用前校验:版本号或 batch 预算变了 → 旧产物失效、重跑该批,
-# 不无脑复用(否则旧格式批/不同分组的 merge 缓存会与新参数混用,污染结构 reduce 的跨批拼接)。
+# MAP/merge 落盘产物的格式版本指纹。续跑复用前校验:版本号、batch 预算、或 analyst prompt
+# 内容变了 → 旧产物失效、重跑该批,不无脑复用(否则旧格式批/旧 prompt 产物会与新口径混用)。
 # v2 = MAP 输出含「结构台账」两段格式。改格式/分批口径时,把版本号 +1。
+# 指纹现在还纳入 analyst 系列 prompt 的内容 hash:改了任一 analyst prompt(map/reduce/merge/
+# structure_reduce),hash 自动变 → 全部旧产物失效自动重跑;没改只是崩溃 → hash 不变,断点续跑
+# 照常。这样"改 prompt 必重跑"和"崩溃可续跑"两个目标同时满足,无需手动删文件。
 ANALYST_ARTIFACT_VERSION = "v2"
+
+# 参与指纹 hash 的 analyst prompt 文件(任一变更都使旧产物失效)
+_ANALYST_PROMPT_FILES = (
+    "analyst_map.md", "analyst_reduce.md", "analyst_merge.md", "analyst_structure_reduce.md",
+)
+_ANALYST_PROMPT_HASH_CACHE: Optional[str] = None
+
+
+def analyst_prompt_hash() -> str:
+    """analyst 系列 prompt 的内容 hash(8位)。任一 prompt 改动 → hash 变 → 旧产物失效重跑。
+    进程内缓存:一次运行里 prompt 不会变,只算一次。"""
+    global _ANALYST_PROMPT_HASH_CACHE
+    if _ANALYST_PROMPT_HASH_CACHE is not None:
+        return _ANALYST_PROMPT_HASH_CACHE
+    import hashlib
+    h = hashlib.sha256()
+    for fname in _ANALYST_PROMPT_FILES:
+        body = read_text(PROMPTS_DIR / fname) or ""
+        # 用 \n 规整化行尾,避免 CRLF/LF 差异导致 hash 抖动(本仓库混用行尾)
+        h.update(fname.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(body.replace("\r\n", "\n").encode("utf-8"))
+        h.update(b"\x00")
+    _ANALYST_PROMPT_HASH_CACHE = h.hexdigest()[:8]
+    return _ANALYST_PROMPT_HASH_CACHE
 
 
 def analyst_fingerprint(batch_budget: int) -> str:
-    return f"<<ANALYST-FMT {ANALYST_ARTIFACT_VERSION} batch={batch_budget}>>"
+    return f"<<ANALYST-FMT {ANALYST_ARTIFACT_VERSION} batch={batch_budget} prompt={analyst_prompt_hash()}>>"
 
 
 def stamp_fingerprint(body: str, batch_budget: int) -> str:

@@ -25,6 +25,10 @@ echo   One-time full-text scan: prose chunks + structure report.
 echo ------------------------------------------------------------
 echo   * Token-heavy: MAP input ~2.48M tok, 41 batches.
 echo   * Resumable: close window / shutdown any time, re-run to continue.
+echo   * Auto-rerun: if you edited any analyst prompt, the content hash
+echo     changes and ALL stale batches are re-run automatically (no need
+echo     to delete anything). Crash-resume still works when prompts are
+echo     unchanged.
 echo   * Graceful stop: double-click the stop bat in this folder.
 echo ============================================================
 echo.
@@ -36,6 +40,30 @@ if errorlevel 2 (
   exit /b 0
 )
 
+echo.
+echo Run mode:
+echo   [R] Resume - keep valid batches, re-run only changed/missing ones
+echo                (normal choice; respects prompt-hash auto-rerun)
+echo   [C] Clean  - DELETE all analyst artifacts and re-run EVERYTHING
+echo                from batch 0 (burns full token cost again)
+echo.
+choice /c RC /n /m "Choose mode ([R]esume / [C]lean): "
+if errorlevel 2 goto ASK_CLEAN
+goto AFTER_MODE
+
+:ASK_CLEAN
+echo.
+echo You chose CLEAN. This will delete runtime\analyst\ entirely.
+choice /c YN /n /m "Are you sure? This cannot be undone. (Y/N) "
+if errorlevel 2 (
+  echo Clean cancelled, falling back to Resume mode.
+  goto AFTER_MODE
+)
+echo Deleting runtime\analyst\ ...
+rmdir /s /q "%RUNTIME%\analyst" >nul 2>nul
+echo Done. Starting a full clean re-run.
+
+:AFTER_MODE
 rem Clear any leftover stop/pause markers so a fresh run is not blocked.
 del "%RUNTIME%\stop.request" >nul 2>nul
 del "%RUNTIME%\pause.request" >nul 2>nul

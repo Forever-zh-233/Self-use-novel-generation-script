@@ -1109,6 +1109,23 @@ def run(h: TestHarness) -> None:
         h.includes("去指纹后结构段保留真名", s, "铜铃@48")
         # SKIP 标记不被指纹逻辑误伤
         h.check("SKIP 标记不被指纹剥离", rp.strip_fingerprint("<<SKIP: 风控>>") == "<<SKIP: 风控>>", "")
+        # prompt 内容 hash 纳入指纹:改了 analyst prompt → 旧产物自动失效重跑;没改 → 续跑
+        prompts_dir = tmp / "prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        for fn in ("analyst_map.md", "analyst_reduce.md", "analyst_merge.md", "analyst_structure_reduce.md"):
+            _write(prompts_dir / fn, f"# {fn} 初版内容\n规则A")
+        rp.PROMPTS_DIR = prompts_dir
+        rp._ANALYST_PROMPT_HASH_CACHE = None
+        fp_v1 = rp.analyst_fingerprint(60000)
+        stamped_v1 = rp.stamp_fingerprint("body", 60000)
+        rp._ANALYST_PROMPT_HASH_CACHE = None
+        h.check("同 prompt 指纹稳定(崩溃可续跑)", rp.fingerprint_ok(stamped_v1, 60000), fp_v1)
+        # 改一个 analyst prompt 的内容
+        _write(prompts_dir / "analyst_map.md", "# analyst_map.md 加了配角/POV/修炼/三线维度\n规则A\n规则B")
+        rp._ANALYST_PROMPT_HASH_CACHE = None
+        fp_v2 = rp.analyst_fingerprint(60000)
+        h.check("改 analyst prompt 后指纹变化", fp_v1 != fp_v2, f"{fp_v1} -> {fp_v2}")
+        h.check("旧 prompt 产物在新 hash 下失效(自动重跑)", not rp.fingerprint_ok(stamped_v1, 60000), "")
 
     h.section("scenario: 输出截断→加大预算重试,不再同预算空转(archivist 截断根因)")
     with isolated_workspace() as tmp:

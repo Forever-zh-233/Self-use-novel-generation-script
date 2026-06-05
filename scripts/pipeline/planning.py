@@ -634,7 +634,7 @@ def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> N
         cli_print("[volume_planner] dry-run: prompt 已保存,未调用 API。")
         return
     cli_print(f"[volume_planner] 第{chapter}章:卷纲即将用完,自动生成下一卷卷纲…")
-    result = call_role("volume_planner", prompt, input_text, RUNTIME_DIR / "volume_planner_output.md", timeout, 5000)
+    result = call_role("volume_planner", prompt, input_text, RUNTIME_DIR / "volume_planner_output.md", timeout, 15000)
     # 备份旧卷纲
     old = read_text(VOLUME_PLAN_FILE)
     if old.strip():
@@ -1294,6 +1294,19 @@ def active_arcs_for_beat(chapter: int) -> str:
             fops = arc.get("foreshadowing_ops") or []
             if fops and not all_fs:
                 lines.append(f"伏笔操作(本弧线规划的,找合适章节安排):{'; '.join(str(f) for f in fops)}")
+    # 高潮硬约束:当本章正处于 tension=高潮/高 的节点当章(±1)时,强制要求标关键章
+    for arc in arcs:
+        for n in arc.get("nodes") or []:
+            nch = int(n.get("chapter", 0) or 0)
+            tension = str(n.get("tension", "")).strip()
+            if tension in CLIMAX_TENSIONS and abs(nch - chapter) <= 1:
+                lines.append(
+                    f"\n⚠ 【硬约束】本章落在弧线高潮节点(第{nch}章 tension={tension})±1范围内——"
+                    f"**必须**在 beat 里标 `\"关键章\": true`。这不是建议,是分层执行的铁律:"
+                    f"arc_planner 标了高潮 → beat_planner 必须标关键章 → writer 必须写出爆点。"
+                    f"高潮节点={n.get('beat_hint','?')[:40]}"
+                )
+                break
     return "\n".join(lines)
 
 

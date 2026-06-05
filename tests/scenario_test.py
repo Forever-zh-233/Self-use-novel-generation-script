@@ -962,6 +962,34 @@ def run(h: TestHarness) -> None:
         h.includes("世界重量是软提示非KPI", director_prompt, "软提示")
         h.includes("连续N章无生命危险触发条件", director_prompt, "生命危险")
 
+    h.section("scenario: 高潮节点强制标关键章(active_arcs_for_beat 硬约束注入)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        core, api, state, context, gates, archivist = _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        importlib.reload(planning)
+        # 弧线:第20章 tension=高潮
+        arcs = [{"arc_id": "ARC-CX", "title": "危机爆发", "type": "主线推进",
+                 "span": [15, 25], "summary": "主线高潮",
+                 "resolution_condition": "解危",
+                 "nodes": [
+                     {"chapter": 15, "beat_hint": "前兆", "tension": "中",
+                      "approach_to_next": "蓄力", "chapter_drift": [{"ch": 18, "gist": "暗流汇聚"}]},
+                     {"chapter": 20, "beat_hint": "全面爆发正面对峙", "tension": "高潮"},
+                     {"chapter": 25, "beat_hint": "余波收束", "tension": "低"},
+                 ]}]
+        planning.save_active_arcs(arcs)
+        # 本章=20,正好在高潮节点 → 必须出现硬约束
+        out_20 = planning.active_arcs_for_beat(20)
+        h.includes("高潮当章出现硬约束", out_20, "必须")
+        h.includes("高潮当章提到关键章", out_20, "关键章")
+        # 本章=21(±1范围) → 也应出现
+        out_21 = planning.active_arcs_for_beat(21)
+        h.includes("高潮±1章也出现硬约束", out_21, "必须")
+        # 本章=18(离高潮2章) → 不该出现硬约束
+        out_18 = planning.active_arcs_for_beat(18)
+        h.not_includes("离高潮2章不触发硬约束", out_18, "必须.*关键章")
+
     h.section("scenario: 场景装置去重(recent_scene_devices_digest)抓跨章同招")
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)

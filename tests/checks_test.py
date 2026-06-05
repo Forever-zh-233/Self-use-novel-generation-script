@@ -18,6 +18,10 @@ PYTHON_GLOBS = [
     "tests/*.py",
 ]
 
+# 项目骨干:人工维护的静态文档 + 源码,缺了就跑不起来。
+# 注意:这里只放静态文件。运行时动态生成物(如 卷纲/10-卷纲.md 由 volume_planner
+# 生成、会被 clean_chapter_artifacts.py 清除)不属于此清单——它们的"缺失"是正常态,
+# 当必需文件断言会和清理脚本直接打架。
 REQUIRED_FILES = [
     "agent.md",
     "README-使用说明.md",
@@ -31,7 +35,6 @@ REQUIRED_FILES = [
     "11-负空间.md",
     "12-AI腔黑名单.md",
     "15-长线伏笔资产库.md",
-    "卷纲/10-卷纲.md",
     "config/models.json",
     "config/run.json",
     "chunks/index.json",

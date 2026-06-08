@@ -306,17 +306,17 @@
   },
   "情感高潮手法": {
     "file": "chunk_情感高潮手法.md",
-    "tokens": 1325,
+    "tokens": 1745,
     "category": "手法"
   },
   "铺垫手法": {
     "file": "chunk_铺垫手法.md",
-    "tokens": 1308,
+    "tokens": 1745,
     "category": "手法"
   },
   "节奏控制手法": {
     "file": "chunk_节奏控制手法.md",
-    "tokens": 1473,
+    "tokens": 1846,
     "category": "手法"
   },
   "潜台词": {
@@ -378,5 +378,30 @@
     "file": "chunk_升级代价.md",
     "tokens": 774,
     "category": "精品手法"
+  },
+  "信息差经营": {
+    "file": "chunk_信息差经营.md",
+    "tokens": 1645,
+    "category": "手法"
+  },
+  "配角塑造": {
+    "file": "chunk_配角塑造.md",
+    "tokens": 1865,
+    "category": "手法"
+  },
+  "多视角切换": {
+    "file": "chunk_多视角切换.md",
+    "tokens": 1466,
+    "category": "手法"
+  },
+  "修炼线编织": {
+    "file": "chunk_修炼线编织.md",
+    "tokens": 1758,
+    "category": "手法"
+  },
+  "三线交织": {
+    "file": "chunk_三线交织.md",
+    "tokens": 1702,
+    "category": "手法"
   }
 }

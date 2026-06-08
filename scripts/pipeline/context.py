@@ -923,9 +923,14 @@ def select_chunks(beat: Dict[str, Any]) -> Dict[str, str]:
             hits = sum(1 for word in keywords if word in beat_text)
             if hits > 0:
                 candidates.append((hits, chunk_name))
-    # 命中数多的优先(更贴合本章);同分按 keyword_chunks 原顺序(稳定)
+    # 命中数多的优先选入(更贴合本章);同分按 keyword_chunks 原顺序(稳定)
     candidates.sort(key=lambda x: -x[0])
-    for _hits, chunk_name in candidates[:MAX_KEYWORD_CHUNKS]:
+    chosen = candidates[:MAX_KEYWORD_CHUNKS]
+    # 缓存优化:选出哪几张由命中数决定,但「输出顺序」固定按 keyword_chunks 定义序,
+    # 不按命中数排。否则同一组卡因命中数逐章波动而顺序抖动,破 prompt 缓存前缀。
+    chunk_order = {name: i for i, (name, _kw) in enumerate(keyword_chunks)}
+    chosen.sort(key=lambda x: chunk_order.get(x[1], 999))
+    for _hits, chunk_name in chosen:
         selected[f"功能_{chunk_name}"] = load_chunk(chunk_name, index)
         selected_chunk_keys.add(chunk_name)
     for char in (beat.get("出场角色") or ["沈安"])[:4]:
@@ -1179,7 +1184,7 @@ def recent_signature_warnings(chapter: int, lookback: int = 5) -> str:
     return "\n".join(lines)
 
 
-def writer_focus_modules(beat: Dict[str, Any]) -> str:
+def writer_focus_modules(beat: Dict[str, Any], include_protagonist_sensory: bool = True) -> str:
     """按 beat 内容选择性注入写作要点模块,避免 writer prompt 过载、注意力分散。
     只注入本章真正相关的规则,没标注的字段不注入对应模块。"""
     beat_blob = json.dumps(beat, ensure_ascii=False)
@@ -1204,10 +1209,10 @@ def writer_focus_modules(beat: Dict[str, Any]) -> str:
     # 黑子:出场才注入
     if "黑子" in cast or "黑子" in beat_blob:
         add("黑子")
-    # 视觉:白天/强光/夜里相关,或装瞎相关场景。默认注入(主角核心设定,大部分章节相关)
-    add("视觉")
-    # 盲感官:主角靠听/触/嗅/温度/空间感知世界。默认注入(本书最独特的画面来源,几乎每章相关)
-    add("盲感官")
+    if include_protagonist_sensory:
+        # 主角核心感官规则；POV 章不默认注入，避免非盲人视角被写成沈安。
+        add("视觉")
+        add("盲感官")
     # 深度模块:仅当 beat 标注对应字段且不为"无"
     def field_active(key: str) -> bool:
         v = str(beat.get(key) or "").strip()
@@ -1230,24 +1235,111 @@ def writer_focus_modules(beat: Dict[str, Any]) -> str:
     return "\n\n---\n\n".join(selected)
 
 
-def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
-    chapter = int(beat.get("章节编号") or 0)
-    sections = [
-        make_section("故事核安全版", safe_story_core_for_writer(), "critical", False),
-        make_section("世界观设定安全版", safe_world_bible_for_writer(), "critical", False),
-        make_section("修炼境界安全版", safe_cultivation_for_writer(), "normal", True),
-        make_section("卷纲安全版", safe_outline_for_writer(chapter), "high", True),
-        make_section("长线伏笔安全提醒", long_foreshadowing_text(chapter, writer_safe=True), "high", True),
-        make_section("即时状态（时间线/地点/本章角色状态）", writer_state_digest(beat), "high", True),
-        # 正典账本：悬空账/强约束/资源常驻不可压缩，是防穿帮和逻辑崩坏的命门
-        make_section("正典账本（资源/未结清账/约束/本章相关实体与关系）", ledger_context_for_writer(beat), "critical", False),
-        # 血肉：本章出场角色的内在演变笔记
-        make_section("本章出场角色·内在笔记", character_arcs_for_writer(beat), "high", True),
-        make_section("最近台账日志摘录", recent_ledger_tail(), "low", True),
-    ]
+def style_metrics_digest_for_writer() -> str:
+    """把 analyst 量化风格指标压成 writer 可执行的短摘要。
+    只取数字特征，不注入 high_freq_words、源文专名或原句。"""
+    metrics = load_json(BASE_DIR / "分析草稿" / "style_metrics.json")
+    if not isinstance(metrics, dict) or not metrics:
+        return ""
+
+    def val(mapping: Dict[str, Any], key: str) -> str:
+        value = mapping.get(key)
+        if isinstance(value, float):
+            return f"{value:.1f}"
+        return str(value) if value is not None else "?"
+
+    lines: List[str] = ["这是从源文本量化出的风格参考，只当执行校准，不当 KPI 硬凑。"]
+    sentence = metrics.get("sentence") or {}
+    if isinstance(sentence, dict) and sentence:
+        lines.append(
+            f"- 句长：均值 {val(sentence, 'mean')}，中位 {val(sentence, 'median')}，"
+            f"p10/p90={val(sentence, 'p10')}/{val(sentence, 'p90')}；长短句要交替，别整章同一节拍。"
+        )
+    paragraph = metrics.get("paragraph") or {}
+    single = metrics.get("single_sentence_paragraph") or {}
+    if isinstance(paragraph, dict) and paragraph:
+        ratio = val(single if isinstance(single, dict) else {}, "single_sentence_ratio_percent")
+        lines.append(
+            f"- 段落：均值 {val(paragraph, 'mean')} 字，中位 {val(paragraph, 'median')} 字；"
+            f"单句成段约 {ratio}%，只在动作/反应/钩子处使用，别把每句都拆成 PPT。"
+        )
+    dialogue = metrics.get("dialogue_style") or {}
+    if isinstance(dialogue, dict) and dialogue:
+        lines.append(
+            f"- 对话：纯引号约 {val(dialogue, 'pure_quote_ratio_percent')}%，"
+            f"说话标签约 {val(dialogue, 'with_speaker_tag_ratio_percent')}%，"
+            f"动作尾巴约 {val(dialogue, 'with_action_tail_ratio_percent')}%；少解释，多让动作和停顿承载潜台词。"
+        )
+    endings = metrics.get("chapter_endings") or {}
+    if isinstance(endings, dict) and endings:
+        lines.append(
+            f"- 章末：末行均长约 {val(endings, 'avg_last_line_length')} 字，"
+            f"短收束占比 {val(endings, 'short_ending_ratio_percent')}%，避免用抽象悬念词硬吊胃口。"
+        )
+    return "\n".join(lines[:5])
+
+
+def append_selected_chunk_sections(
+    sections: List[Dict[str, Any]],
+    beat: Dict[str, Any],
+    skip_role_names: Optional[List[str]] = None,
+    only: Optional[str] = None,
+) -> None:
+    """把 select_chunks 选出的手法/角色卡注入 sections。
+    only 参数控制注入哪一类(用于 prompt 缓存优化的分段排序):
+      - "static": 只注入每章必出且内容不变的卡(黄金法则/负空间/AI腔黑名单/场景价值转变)
+      - "dynamic": 只注入随 beat 变化的卡(其余功能卡 + 角色卡)
+      - None(默认): 全注入,保持旧行为(其他角色复用此函数时不受影响)
+    分段是为了让静态卡排进缓存前缀、动态卡排后面,不影响选卡逻辑本身。"""
+    STATIC_CHUNK_NAMES = {"黄金法则", "负空间", "AI腔黑名单", "功能_场景价值转变"}
+    skip_role_names = skip_role_names or []
     for name, content in select_chunks(beat).items():
+        if any(name == f"角色_{role}" for role in skip_role_names):
+            continue
+        is_static = name in STATIC_CHUNK_NAMES
+        if only == "static" and not is_static:
+            continue
+        if only == "dynamic" and is_static:
+            continue
         priority = "critical" if name in ("黄金法则", "负空间", "AI腔黑名单") else "normal"
         sections.append(make_section(name, content, priority, priority != "critical"))
+
+
+def build_writer_sections(beat: Dict[str, Any]) -> List[Dict[str, Any]]:
+    chapter = int(beat.get("章节编号") or 0)
+    # ── prompt 缓存优化:section 按「真静态→半静态→每章必变」物理排序。 ──
+    # mimo 缓存按请求公共前缀命中,前缀遇第一个变化字节即全部失效。把跨章不变的
+    # section 全排最前,最大化可缓存前缀;每章变的全排最后。语义不变,只换排列。
+    #
+    # 各 section 的 volatility(已逐函数核实,2026-06-09):
+    #   真静态(纯文件读,只在改设定文档时变):故事核 / 世界观 / 4张固定手法卡
+    #   半静态(罕变,变了才断后缀,平时蹭前缀):修炼境界(境界突破才变,~数十章一次)
+    #     / 长线伏笔(archivist touch 才变)
+    #   每章必变:卷纲窗口(逐章滑窗) / 台账日志(最近2章) / 其余按beat点亮的卡 / 状态/账本/beat/...
+    # 旧顺序把每章变的卷纲、台账排在静态手法卡之前,导致4张纯静态卡常年丢缓存——这是命中率低的根。
+
+    # 段1·真静态前缀(改设定文档才变,常年命中):故事核 / 世界观 / 固定手法卡(黄金法则/负空间/AI腔/场景价值转变)。
+    sections: List[Dict[str, Any]] = [
+        make_section("故事核安全版", safe_story_core_for_writer(), "critical", False),
+        make_section("世界观设定安全版", safe_world_bible_for_writer(), "critical", False),
+    ]
+    append_selected_chunk_sections(sections, beat, only="static")
+    # 段2·半静态(罕变,蹭段1缓存):修炼境界(境界突破才变) / 长线伏笔(archivist touch 才变)。
+    sections.append(make_section("修炼境界安全版", safe_cultivation_for_writer(), "normal", True))
+    sections.append(make_section("长线伏笔安全提醒", long_foreshadowing_text(chapter, writer_safe=True), "high", True))
+    # 段3·每章必变(全排最后,不污染前缀):卷纲滑窗 / 台账日志 / beat点亮的动态卡 + 角色卡。
+    sections.append(make_section("卷纲安全版", safe_outline_for_writer(chapter), "high", True))
+    sections.append(make_section("最近台账日志摘录", recent_ledger_tail(), "low", True))
+    append_selected_chunk_sections(sections, beat, only="dynamic")
+    # 段3·每章必变:状态/账本/beat/写作要点/空间/意象/回响/境界/旅行/经济/防重复。
+    # 正典账本：悬空账/强约束/资源常驻不可压缩，是防穿帮和逻辑崩坏的命门
+    sections.append(make_section("即时状态（时间线/地点/本章角色状态）", writer_state_digest(beat), "high", True))
+    sections.append(make_section("正典账本（资源/未结清账/约束/本章相关实体与关系）", ledger_context_for_writer(beat), "critical", False))
+    # 血肉：本章出场角色的内在演变笔记
+    sections.append(make_section("本章出场角色·内在笔记", character_arcs_for_writer(beat), "high", True))
+    style_digest = style_metrics_digest_for_writer()
+    if style_digest:
+        sections.append(make_section("源文风格指标执行摘要", style_digest, "normal", True))
     sections.append(make_section("本章 beat", json.dumps(sanitize_beat_for_writer(beat), ensure_ascii=False, indent=2), "critical", False))
     # 按需注入写作要点模块(对话/潜台词/黑子/视觉/情绪裂缝/内在转变/困境主题)
     focus = writer_focus_modules(beat)
@@ -1396,8 +1488,15 @@ def build_pov_writer_input(beat: Dict[str, Any], chapter: int, run_cfg: Dict[str
         make_section("你的视角角色", f"本章从【{pov_char}】的视角写整章。这个人不是主角，有自己的生活和内心世界。", "critical", False),
         make_section("角色信息", entity_text, "critical", False),
         make_section("知识边界（铁律，违反=穿帮）", ignorant_text, "critical", False),
-        make_section("本章 beat", json.dumps(beat, ensure_ascii=False, indent=2), "critical", False),
     ]
+    append_selected_chunk_sections(sections, beat, skip_role_names=["沈安"])
+    style_digest = style_metrics_digest_for_writer()
+    if style_digest:
+        sections.append(make_section("源文风格指标执行摘要", style_digest, "normal", True))
+    sections.append(make_section("本章 beat", json.dumps(beat, ensure_ascii=False, indent=2), "critical", False))
+    focus = writer_focus_modules(beat, include_protagonist_sensory=False)
+    if focus:
+        sections.append(make_section("本章写作要点（POV章适用，未列规则不用强行套用）", focus, "critical", False))
     if time_section:
         sections.append(make_section("时间定位指令", time_section, "critical", False))
     sections.extend([

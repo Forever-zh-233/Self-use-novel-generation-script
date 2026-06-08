@@ -110,7 +110,11 @@ def merge_state_update(update: Dict[str, Any]) -> None:
             if isinstance(item, dict) and item.get("id"):
                 if chapter_no and not item.get("last_advanced"):
                     item["last_advanced"] = int(chapter_no)
-                table[str(item["id"])] = item
+                fid = str(item["id"])
+                # patch merge 不整条替换:只更新 item 携带的字段,
+                # 保留旧条目的 promise/notes/planted_chapter 等(部分回收时尤其重要)
+                existing = table.setdefault(fid, {"id": fid})
+                existing.update(item)
         for item in foreshadowing.get("resolve") or []:
             if isinstance(item, dict) and item.get("id"):
                 fid = str(item["id"])

@@ -42,16 +42,26 @@ def run(h: TestHarness) -> None:
         h.check("hard_gate blocks character alias mixing", not gate["passed"], gate)
         h.check("hard_gate reports alias mixing", any("角色名不一致" in item for item in gate["issues"]), gate)
 
+        not_a_is_b = "沈安停在门口。不是害怕，是骨头自己记住了那条路。"
+        gate = gates.hard_gate(not_a_is_b)
+        h.check("hard_gate blocks narrative not-A-is-B AI tone", not gate["passed"], gate)
+        h.check("hard_gate reports not-A-is-B issue", any("不是A是B" in item for item in gate["issues"]), gate)
+
+        quoted_not_a_is_b = "老头说：“不是害怕，是疼。”\n沈安把碗放回桌上。"
+        gate = gates.hard_gate(quoted_not_a_is_b)
+        h.check("hard_gate ignores quoted not-A-is-B dialogue", gate["passed"], gate)
+
+        # 注水/AI泛化表达属文风审美，降级为 warning 交 reviewer，不再硬阻断(反 Goodhart)。
         filler = "他想起了很多。院子里很静。"
         gate = gates.hard_gate(filler)
-        h.check("hard_gate blocks known filler phrase", not gate["passed"], gate)
-        h.check("hard_gate reports filler", any("注水" in item for item in gate["issues"]), gate)
+        h.check("hard_gate does not hard-block filler phrase", gate["passed"], gate)
+        h.check("hard_gate warns on filler", any("注水" in item for item in gate.get("warnings") or []), gate)
 
         safe = "沈安把竹杖横在膝上。\n黑子蹲在门槛边，鼻尖沾着一点灰。\n风从院墙上过去，没有人说话。"
         gate = gates.hard_gate(safe)
         h.check("hard_gate allows clean short sample", gate["passed"], gate)
 
-    h.section("quick: style gate is diagnostic except objective bad terms")
+    h.section("quick: style gate is diagnostic, aesthetic terms warn not block")
     with isolated_workspace() as tmp:
         core, api, gates, state = _import_pipeline_modules()
 
@@ -61,10 +71,12 @@ def run(h: TestHarness) -> None:
         h.check("style_gate returns metrics for reviewer", bool(result.get("metrics")), result)
         h.check("style_gate exposes short_sentence_ratio metric", "short_sentence_ratio" in result["metrics"], result)
 
+        # 情绪总结词是 AI 腔标志，但属文风审美，降级为 warning 交 reviewer，数字保留在 metrics。
         bad = "沈安心中一震。"
         result = gates.style_gate(bad)
-        h.check("style_gate blocks unambiguous emotion summary term", not result["passed"], result)
-        h.check("style_gate reports emotion summary", any("情绪总结词" in item for item in result["issues"]), result)
+        h.check("style_gate does not hard-block emotion summary term", result["passed"], result)
+        h.check("style_gate warns on emotion summary", any("情绪总结词" in item for item in result.get("warnings") or []), result)
+        h.check("style_gate keeps emotion_summary_count metric", result["metrics"].get("emotion_summary_count", 0) > 0, result)
 
     h.section("quick: review parsing and JSON cleanup")
     with isolated_workspace() as tmp:

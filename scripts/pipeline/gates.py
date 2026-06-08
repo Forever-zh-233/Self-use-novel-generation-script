@@ -265,13 +265,11 @@ def hard_gate(text: str) -> Dict[str, Any]:
         if leak in text:
             issues.append(f"正文泄露系统元信息: '{leak}'")
             break
-    # "不是A是B"句式检测：只检测引号外的叙述部分（对话里角色说"不是"是合理的）
-    narrative_parts = re.sub(r'"[^"]*"', '', text)
+    # "不是A是B"是已验证长期复发的无歧义 AI 腔坏味道；只检测引号外叙述部分。
+    narrative_parts = re.sub(r'("[^"]*"|“[^”]*”|「[^」]*」|『[^』]*』)', '', text)
     not_a_is_b = re.findall(r'不是[^，。！？"\n]{1,20}[，—]+\s*是[^。！？"\n]{1,20}', narrative_parts)
-    if len(not_a_is_b) >= 2:
+    if not_a_is_b:
         issues.append(f"AI腔'不是A是B'句式在叙述中出现{len(not_a_is_b)}次（已全禁）：{'｜'.join(s[:15] for s in not_a_is_b[:3])}")
-    elif len(not_a_is_b) == 1:
-        warnings.append(f"AI腔'不是A是B'句式出现1次：{not_a_is_b[0][:20]}")
     for group in [["沈安", "沈归舟"], ["黑子", "阿墨"], ["方绾", "方青瓷"]]:
         found = [name for name in group if name in text]
         if len(found) > 1:
@@ -282,13 +280,13 @@ def hard_gate(text: str) -> Dict[str, Any]:
             if len(bare) <= 2:
                 warnings.append(f"短伪例命中，需人工/评审确认是否只是自然短句: {example}")
             else:
-                issues.append(f"疑似照抄角色伪例: {example}")
+                warnings.append(f"疑似照抄角色伪例（交 reviewer 判断）: {example}")
     paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
     # 长段落/长句/正文偏长 已去牙(style_gate metrics 有中性数字给 reviewer)。
     sentences = [s.strip() for s in re.split(r"[。！？!?\n]+", text) if s.strip()]
     for phrase in filler_phrases:
         if text.count(phrase) >= 1:
-            issues.append(f"疑似注水/AI泛化表达: {phrase}")
+            warnings.append(f"疑似注水/AI泛化表达（交 reviewer 判断）: {phrase}")
     dialogue_lines = [line for line in paragraphs if "\"" in line or "“" in line or "”" in line]
     explain_hits = []
     for line in dialogue_lines:
@@ -297,10 +295,10 @@ def hard_gate(text: str) -> Dict[str, Any]:
                 explain_hits.append(line[:80])
                 break
     if explain_hits:
-        issues.append(f"疑似解释型对话 {len(explain_hits)} 处。")
+        warnings.append(f"疑似解释型对话 {len(explain_hits)} 处（交 reviewer 判断）。")
     last_part = text[-400:]
     if any(phrase in last_part for phrase in empty_hook_phrases):
-        issues.append("章末疑似空钩子：抽象危机词出现在最后400字。")
+        warnings.append("章末疑似空钩子：抽象危机词出现在最后400字（交 reviewer 判断）。")
     # 章末钩子：源文统计悬念词收尾0%，靠短句留白。最后200字若靠"突然/竟然"式词收尾，软提醒
     cliche_hook_words = ["突然", "忽然", "竟然", "没想到", "万万没想到", "下一刻", "就在这时", "殊不知"]
     hook_zone = text[-200:]
@@ -353,9 +351,11 @@ def style_gate(text: str) -> Dict[str, Any]:
         ),
         "breath_count": len(re.findall(r"\d+息", text)),
     }
+    warnings: List[str] = []
+    # 情绪总结词是 AI 腔标志，但属文风审美，降为 warning 交 reviewer；数字已在 metrics 里。
     if metrics["emotion_summary_count"] > 0:
-        issues.append("出现情绪总结词。")
-    return {"passed": not issues, "issues": issues, "metrics": metrics}
+        warnings.append(f"出现情绪总结词 {metrics['emotion_summary_count']} 次（交 reviewer 判断）。")
+    return {"passed": not issues, "issues": issues, "warnings": warnings, "metrics": metrics}
 
 
 def continuity_check(text: str, chapter: int) -> Dict[str, Any]:
@@ -476,13 +476,15 @@ def make_review_input(
     from pipeline.summarizer import repetition_context_for_reviewer
     checklist = cast_checklist_for_reviewer(text)
     rep_ctx = repetition_context_for_reviewer(chapter)
+    # prompt 缓存优化:静态评判标准(风格指南/AI腔黑名单,跨章不变)排最前建缓存前缀;
+    # 故事总监批注每5章变一次(半静态)居中;每章变的(beat/硬检查/正文/清单)排后面。
     sections = [
+        make_section("风格指南", read_text(BASE_DIR / "01-风格指南.md"), "critical", False),
+        make_section("AI腔黑名单", read_text(BASE_DIR / "12-AI腔黑名单.md"), "critical", False),
+        make_section("故事总监批注", story_director_context(chapter), "critical", False),
         make_section("本章 beat（评判基准：写手是否忠实执行了这个规划）",
                      json.dumps(beat, ensure_ascii=False, indent=2) if beat else "无",
                      "critical", False) if beat else None,
-        make_section("故事总监批注", story_director_context(chapter), "critical", False),
-        make_section("风格指南", read_text(BASE_DIR / "01-风格指南.md"), "critical", False),
-        make_section("AI腔黑名单", read_text(BASE_DIR / "12-AI腔黑名单.md"), "critical", False),
         make_section(
             "脚本硬检查结果",
             json.dumps(diagnostics or {}, ensure_ascii=False, indent=2),
@@ -491,7 +493,7 @@ def make_review_input(
         ),
         make_section("出场角色核实清单", checklist, "high", False) if checklist else None,
         make_section("近期章节表达摘要（检查本章是否重复）", rep_ctx, "high", True) if rep_ctx else None,
-        make_section("待评审正文", text, "high", True),
+        make_section("待评审正文", text, "critical", False),
     ]
     sections = [s for s in sections if s]
     return compress_sections_if_needed("reviewer", chapter, sections, run_cfg, timeout)
@@ -548,6 +550,7 @@ def parse_review_verdict(review: str) -> Dict[str, Any]:
                     return {
                         "needs_revision": bool(data.get("needs_revision")),
                         "total": data.get("total"),
+                        "scores": data.get("scores") or {},
                         "blockers": data.get("blockers") or [],
                         "source": "json",
                     }
@@ -555,7 +558,7 @@ def parse_review_verdict(review: str) -> Dict[str, Any]:
                 continue
     # ③④ 解析失败:回退关键词;命中=必修,没命中=默认放行
     kw = _parse_review_keywords(review)
-    return {"needs_revision": kw, "total": None, "blockers": [], "source": "keyword"}
+    return {"needs_revision": kw, "total": None, "scores": {}, "blockers": [], "source": "keyword"}
 
 
 def parse_score_needs_revision(review: str) -> bool:

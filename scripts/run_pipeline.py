@@ -15,6 +15,7 @@ r"""
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -36,13 +37,28 @@ from pipeline.context import *  # noqa: F401,F403
 from pipeline.gates import *  # noqa: F401,F403
 from pipeline.planning import *  # noqa: F401,F403
 from pipeline.archivist import *  # noqa: F401,F403
-from pipeline.summarizer import generate_chapter_summary
+from pipeline.summarizer import generate_chapter_summary, summary_path
 
 
 REJECTION_PATTERN = re.compile(
     r"the request was rejected because it was considered high risk",
     re.IGNORECASE,
 )
+
+
+def flag_for_review(chapter: int, reason: str, detail: str = "") -> None:
+    """把一章标记为"待人工复核",但绝不停机——首要目的是通宵跑不中断。
+    检出客观穿帮/残留穿帮时,记录到 输出/_待复核章节.md(append-only,每章一行),
+    并在该章产物目录留一份 needs_review.md,早上人工扫一眼决定是否重跑。
+    隔离靠记录+人工,不靠停机:停机会让一次 LLM 误报毁掉整晚。"""
+    try:
+        line = f"- 第{chapter}章 [{reason}] {detail}".rstrip()
+        append_text(OUTPUT_DIR / "_待复核章节.md", line)
+        write_text(role_artifact("gate", chapter, "needs_review.md"),
+                   f"# 第{chapter}章 待复核\n\n原因：{reason}\n\n{detail}")
+        cli_print(f"[needs_review] 第{chapter}章已标记待复核（{reason}），不停机继续跑。")
+    except Exception as exc:  # 标记失败也绝不能拖垮通宵跑
+        cli_print(f"[needs_review] 第{chapter}章标记写入失败（不影响继续）：{exc}")
 
 
 def write_score_report(chapter: int, verdict: Dict[str, Any]) -> None:
@@ -77,6 +93,29 @@ def write_score_report(chapter: int, verdict: Dict[str, Any]) -> None:
         write_text(SCORE_REPORT_DIR / f"第{chapter:03d}章.md", "\n".join(lines))
     except OSError as exc:
         cli_print(f"[score_report] 第{chapter}章评分简报写入失败（不影响正文）：{exc}")
+
+
+def text_sha256(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def final_gate_for_text(text: str, chapter: int, beat: Dict[str, Any]) -> Dict[str, Any]:
+    hard = hard_gate(text)
+    style = style_gate(text)
+    continuity = continuity_check(text, chapter)
+    adjacent = continuity_check_adjacent(chapter, text, beat)
+    type_guard = type_guard_check(text, chapter)
+    satisfaction = chapter_satisfaction_check(text, beat)
+    gate = combine_checks({
+        "hard_gate": hard,
+        "style_gate": style,
+        "continuity_check": continuity,
+        "adjacent_continuity": {"passed": not adjacent, "issues": adjacent, "warnings": []},
+        "type_guard": type_guard,
+        "satisfaction_check": {"passed": not satisfaction, "issues": [], "warnings": satisfaction},
+    })
+    gate["checked_text_sha256"] = text_sha256(text)
+    return gate
 
 
 
@@ -127,12 +166,114 @@ def normalize_beat(chapter: int, beat: Dict[str, Any]) -> Dict[str, Any]:
         "情绪弧线",
         "情绪基调",
         "钩子型",
-        "关键章",
+        # —— 以下字段曾因不在白名单被静默丢弃,导致 arc 下发/prompt 要求 writer 执行、
+        #    但落盘 beat 里根本没有这些键 → writer 永远收不到 →「经常不切多维度」的真因。
+        #    sanitize_beat_for_writer 本就保留全字段,补进白名单即接通 arc→beat→writer 全链路。
+        "多角度叙事",
+        "系统了愿",
+        "修炼锚点",
+        "配角本章动作",
     ]:
         if key in beat:
             normalized[key] = str(beat.get(key) or "无")
+    # 关键章是布尔语义,不能字符串化:str(True)="True"、str(False)="无" 都是 truthy,
+    # 会让下游 bool(beat.get("关键章")) 恒为真(best_of_n 路1误触发)。落盘为真布尔。
+    if "关键章" in beat:
+        v = beat.get("关键章")
+        if isinstance(v, str):
+            normalized["关键章"] = v.strip().lower() in ("true", "是", "1", "yes", "y")
+        else:
+            normalized["关键章"] = bool(v)
     return normalized
 
+
+
+def _truthy_beat_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "是", "1", "yes", "y")
+    return bool(value)
+
+
+def beat_angle_check(beat: Dict[str, Any], chapter: int) -> Dict[str, Any]:
+    """多角度吸收校验(客观配额,不判断切得好不好):
+    arc_planner 为本章下发了 in_chapter_angles 时,beat 的「多角度叙事」字段必须
+    要么落实、要么显式写明为何不适用(带理由的"无")。裸空 / 裸"无" / 缺字段 = 没吸收。
+    切得自不自然、配角活不活,交 reviewer——这里只确保"arc 给了配额、beat 没静默吞掉"。
+    这是多角度退化"软请求链"的 beat 层硬化点,与 arc 层(prompt 自查)、reviewer 层(豁免)合成闭环。"""
+    issues: List[str] = []
+    designated = designated_angles_for_chapter(chapter)
+    if designated:
+        field = str(beat.get("多角度叙事") or "").strip()
+        # 裸空、缺字段、或只写了"无/没有/不适用"却没跟任何理由 → 视为未吸收。
+        bare_no = field in ("", "无", "没有", "不适用", "None")
+        if bare_no:
+            who = "、".join(str(a.get("character", "?")) for a in designated)
+            issues.append(
+                f"弧线为本章下发了章内多角度配额(切到:{who}),但 beat 的「多角度叙事」"
+                f"为空或只写「无」却没注明理由。要么落实这次短切,要么写明为何本章不适用"
+                f"(如『本章高张力连续动作不宜中断』)。"
+            )
+    return {"passed": not issues, "issues": issues, "warnings": [], "metrics": {"designated_angles": len(designated)}}
+
+
+def arc_absorption_check(beat: Dict[str, Any], chapter: int) -> Dict[str, Any]:
+    """弧线叙事指令吸收校验(最小客观版)。
+
+    不判断“写得好不好/是否自然”(交 reviewer)，只查 arc_planner 明确下发的
+    可机器核对义务有没有被 beat 静默吞掉：POV、伏笔操作、高潮关键章。
+    """
+    issues: List[str] = []
+    metrics = {"pov_ops": 0, "foreshadowing_ops": 0, "climax_windows": 0}
+    arcs = load_active_arcs()
+    for arc in arcs:
+        for node in (arc.get("nodes") or []):
+            nch = int(node.get("chapter", 0) or 0)
+            nops = node.get("narrative_ops") or {}
+            if nch == chapter:
+                pov = nops.get("pov")
+                if pov:
+                    metrics["pov_ops"] += 1
+                    expected_char = str(pov.get("character") or "").strip()
+                    if expected_char and str(beat.get("视角角色") or "").strip() != expected_char:
+                        issues.append(f"弧线指定本章 POV 角色为「{expected_char}」,但 beat 视角角色为「{beat.get('视角角色','')}」。")
+                    expected_type = str(pov.get("type") or pov.get("time_relation") or "").strip()
+                    if expected_type and expected_type not in ("顺叙", "平叙"):
+                        method = str(beat.get("叙事手法") or "").strip()
+                        anchor = str(beat.get("时间锚点") or "").strip()
+                        if expected_type not in method and not anchor:
+                            issues.append(f"弧线指定 POV 时间关系/类型「{expected_type}」,但 beat 未在叙事手法或时间锚点落实。")
+                    if not str(beat.get("戏剧目的") or "").strip():
+                        issues.append("弧线指定 POV 章,但 beat 缺少「戏剧目的」。")
+                for fs in (nops.get("foreshadowing") or []):
+                    metrics["foreshadowing_ops"] += 1
+                    fid = str(fs.get("id") or "").strip()
+                    op = str(fs.get("op") or "").strip()
+                    if fid and fid not in str(beat.get("伏笔操作") or ""):
+                        issues.append(f"弧线指定伏笔操作 {op}[{fid}],但 beat 的「伏笔操作」未包含该 ID。")
+            tension = str(node.get("tension", "")).strip()
+            if tension in CLIMAX_TENSIONS and abs(nch - chapter) <= 1:
+                metrics["climax_windows"] += 1
+                if not _truthy_beat_flag(beat.get("关键章")):
+                    issues.append(f"本章落在弧线高潮节点第{nch}章(tension={tension})±1范围内,但 beat 未标「关键章:true」。")
+    # 旧格式 foreshadowing_ops:没有章节定位,只做弱提醒,不硬拦截。
+    return {"passed": not issues, "issues": issues, "warnings": [], "metrics": metrics}
+
+
+def run_beat_validations(beat: Dict[str, Any], chapter: int, suffix: str = "") -> Dict[str, Any]:
+    """统一运行 beat 保存前校验，并落盘报告。
+
+    覆盖三类客观断链：故事总监纠偏、章内多角度配额、弧线 narrative_ops/关键章吸收。
+    suffix 用于区分 retry / after_hook / existing 等不同阶段的报告。
+    """
+    tag = f"_{suffix}" if suffix else ""
+    direction = beat_direction_check(beat, chapter)
+    angle = beat_angle_check(beat, chapter)
+    arc = arc_absorption_check(beat, chapter)
+    dump_json(role_artifact("gate", chapter, f"beat_direction{tag}.json"), direction)
+    dump_json(role_artifact("gate", chapter, f"beat_angle{tag}.json"), angle)
+    dump_json(role_artifact("gate", chapter, f"beat_arc{tag}.json"), arc)
+    problems = (direction.get("issues") or []) + (angle.get("issues") or []) + (arc.get("issues") or [])
+    return {"direction": direction, "angle": angle, "arc": arc, "problems": problems}
 
 
 def beat_direction_check(beat: Dict[str, Any], chapter: int) -> Dict[str, Any]:
@@ -283,8 +424,19 @@ def determine_start_chapter(args_chapter: Optional[int], run_cfg: Dict[str, Any]
 
 def ensure_beat(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], timeout: int) -> Optional[Path]:
     if beat_path.exists():
-        return beat_path
-    if not run_cfg.get("auto_generate_beat", True):
+        existing = normalize_beat(chapter, load_json(beat_path, {}))
+        existing_check = run_beat_validations(existing, chapter, "existing")
+        if not existing_check["problems"]:
+            # 旧缓存/手写 beat 也规范化一次再给 writer，修正关键章字符串等类型坑。
+            dump_json(beat_path, existing)
+            return beat_path
+        msg = "; ".join(existing_check["problems"])
+        if run_cfg.get("auto_generate_beat", True):
+            cli_print(f"[beat_check] 第{chapter}章已有 beat 未通过复验，将自动重生成：{msg[:160]}")
+        else:
+            flag_for_review(chapter, "已有beat复验未通过", msg + "（auto_generate_beat=false，继续使用现有 beat）")
+            return beat_path
+    elif not run_cfg.get("auto_generate_beat", True):
         raise RuntimeError(f"beat 文件不存在：{beat_path}")
 
     beat_input = build_beat_input(chapter, run_cfg, timeout)
@@ -308,11 +460,19 @@ def ensure_beat(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], timeout:
     raw_first = raw
     raw_retry = ""
     beat = normalize_beat(chapter, extract_json_object(raw))
-    direction = beat_direction_check(beat, chapter)
-    dump_json(role_artifact("gate", chapter, "beat_direction.json"), direction)
-    if not direction.get("passed") and not run_cfg.get("dry_run"):
-        cli_print(f"[story_director] 第{chapter}章 beat 未充分吸收故事总监批注,重生成一次。")
-        retry_input = beat_input + "\n\n===== 上一次 beat 的方向问题 =====\n" + json.dumps(direction, ensure_ascii=False, indent=2)
+    validation = run_beat_validations(beat, chapter)
+    direction = validation["direction"]
+    angle = validation["angle"]
+    arc = validation["arc"]
+    # 方向未吸收 / 多角度配额没落实 / 弧线叙事指令没吸收 → 合并问题,重生成一次(走重试,绝不停机)。
+    beat_problems = validation["problems"]
+    if beat_problems and not run_cfg.get("dry_run"):
+        cli_print(f"[beat_check] 第{chapter}章 beat 有 {len(beat_problems)} 处问题(方向/多角度/弧线吸收),重生成一次。")
+        retry_input = (
+            beat_input
+            + "\n\n===== 上一次 beat 的问题(必须在本次修正)=====\n"
+            + json.dumps(beat_problems, ensure_ascii=False, indent=2)
+        )
         raw = call_role(
             "beat_planner",
             beat_prompt,
@@ -324,8 +484,15 @@ def ensure_beat(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], timeout:
         )
         raw_retry = raw
         beat = normalize_beat(chapter, extract_json_object(raw))
-        direction = beat_direction_check(beat, chapter)
-        dump_json(role_artifact("gate", chapter, "beat_direction_retry.json"), direction)
+        validation = run_beat_validations(beat, chapter, "retry")
+        direction = validation["direction"]
+        angle = validation["angle"]
+        arc = validation["arc"]
+        beat_problems = validation["problems"]
+        # 重试后仍有客观吸收问题:标记待复核,绝不停机(通宵优先)。reviewer/人工兜底。
+        if beat_problems:
+            flag_for_review(chapter, "beat客观吸收未落实",
+                            "; ".join(beat_problems) + "（beat 已落盘,正文照常生成,清单待人工复核）")
     # 钩子意象自查:让 beat_planner 对比近章钩子,判自己是否复用了相似意象/结构。
     # 不靠硬编码检测——语义重复只有 LLM 能判。输入极短(<600 tok),每章无条件跑一次。
     hook_self_check_raw = ""
@@ -355,10 +522,30 @@ def ensure_beat(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], timeout:
             if check_result.strip().upper() != "OK":
                 new_hook_data = extract_json_object(check_result)
                 if new_hook_data and new_hook_data.get("章末钩子"):
+                    old_hook = beat.get("章末钩子")
+                    old_hook_type = beat.get("钩子型")
                     beat["章末钩子"] = new_hook_data["章末钩子"]
                     if new_hook_data.get("钩子型"):
                         beat["钩子型"] = new_hook_data["钩子型"]
-                    cli_print(f"[hook_self_check] 第{chapter}章钩子意象复用,已自动换新。")
+                    after_hook = run_beat_validations(beat, chapter, "after_hook")
+                    if after_hook["problems"]:
+                        beat["章末钩子"] = old_hook
+                        beat["钩子型"] = old_hook_type
+                        rollback = run_beat_validations(beat, chapter, "after_hook_rollback")
+                        direction = rollback["direction"]
+                        angle = rollback["angle"]
+                        arc = rollback["arc"]
+                        flag_for_review(
+                            chapter,
+                            "hook自查改写后复验失败",
+                            "; ".join(after_hook["problems"]) + "（已回滚到原钩子,避免改写后绕过方向校验）",
+                        )
+                        cli_print(f"[hook_self_check] 第{chapter}章改写后复验失败,已回滚原钩子。")
+                    else:
+                        direction = after_hook["direction"]
+                        angle = after_hook["angle"]
+                        arc = after_hook["arc"]
+                        cli_print(f"[hook_self_check] 第{chapter}章钩子意象复用,已自动换新并通过复验。")
 
     dump_json(beat_path, beat)
     # 调试留档(不受 cleanup 影响):每章一个子文件夹,存它当时被喂了什么、原样吐了什么、方向校验、最终 beat。
@@ -368,6 +555,8 @@ def ensure_beat(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], timeout:
         "beat_raw_retry.md": raw_retry,
         "hook_self_check.md": hook_self_check_raw,
         "direction.json": json.dumps(direction, ensure_ascii=False, indent=2),
+        "angle.json": json.dumps(angle, ensure_ascii=False, indent=2),
+        "arc.json": json.dumps(arc, ensure_ascii=False, indent=2),
         "beat.json": json.dumps(beat, ensure_ascii=False, indent=2),
     })
     return beat_path
@@ -398,7 +587,7 @@ def make_archive_input(final: str, chapter: int, run_cfg: Dict[str, Any], timeou
     ly_snapshot = f"愿录：{ly_log[-1].get('level_after','?')} 累计{len(ly_log)}次" if ly_log else "愿录：LV1(0/10)"
 
     sections = [
-        make_section("结构化当前状态", structured_state_text(), "high", True),
+        make_section("结构化当前状态", structured_state_text(chapter), "high", True),
         make_section("当前物品清单(计算delta用)", inv_snapshot, "high", False),
         make_section("当前意象注册(计算delta用)", motif_snapshot, "normal", True),
         make_section("愿录状态", ly_snapshot, "normal", True),
@@ -421,9 +610,14 @@ def run_fact_checker(final: str, beat: Dict[str, Any], chapter: int, run_cfg: Di
         if not e or not isinstance(e, dict):
             continue
         card_lines = [f"【{name}】"]
-        for field in ["realm", "skills", "weapons", "injuries", "secrets", "enemies", "current_goal", "faction", "reputation"]:
+        # realm 和 skills 最重要,必须放前面且不截断——factchecker 靠它们判断是否穿帮
+        # 其他字段按优先级附后
+        for field in ["realm", "skills", "injuries", "secrets", "weapons", "enemies", "current_goal"]:
             v = e.get(field)
             if v:
+                # skills 列表可能很长,截取前 30 条防止挤掉 realm
+                if field == "skills" and isinstance(v, list):
+                    v = v[:30]
                 card_lines.append(f"  {field}: {json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v}")
         cards.append("\n".join(card_lines))
     # 物品清单(替代旧资源账)
@@ -589,11 +783,127 @@ def write_best_of_n(chapter: int, beat: Dict[str, Any], writer_prompt: str, writ
 
 
 
+def stable_json_hash(data: Any) -> str:
+    """对 dict/list 等结构做稳定 hash，用作阶段缓存输入指纹。"""
+    return text_sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def file_text_hash(path: Path) -> str:
+    return text_sha256(read_text(path))
+
+
+def directory_text_hash(path: Path, pattern: str = "**/*.md") -> str:
+    if not path.exists():
+        return text_sha256("")
+    lines: List[str] = []
+    for item in sorted(path.glob(pattern)):
+        if item.is_file():
+            try:
+                rel = str(item.relative_to(path))
+            except ValueError:
+                rel = item.name
+            lines.append(rel + "\n" + read_text(item))
+    return text_sha256("\n---FILE---\n".join(lines))
+
+
+def chapter_context_hash() -> str:
+    """规划/写作上下文的轻量指纹。
+
+    draft 缓存复用不能只看 draft.md 存在；state/ledger/弧线/故事总监/写作模块变了，
+    旧 draft 就不一定属于当前输入。这里不读 .env、不读分数表，只 hash 会进入写作输入的项目内材料。
+    """
+    paths = [
+        STATE_FILE, LEDGER_FILE, ACTIVE_THREADS_FILE, ACTIVE_ARCS_FILE, STORY_DIRECTOR_FILE,
+        MASTER_OUTLINE_FILE, VOLUME_PLAN_FILE, LONG_FORESHADOWING_FILE,
+        BASE_DIR / "01-风格指南.md", BASE_DIR / "02-世界观设定圣经.md", BASE_DIR / "02-修炼境界.md",
+        BASE_DIR / "09-故事核.md", BASE_DIR / "11-负空间.md", BASE_DIR / "12-AI腔黑名单.md",
+        BASE_DIR / "分析草稿" / "style_metrics.json",
+        CHUNKS_DIR / "index.json",
+    ]
+    payload = []
+    for path in paths:
+        payload.append(str(path.name) + ":" + file_text_hash(path))
+    payload.append("writer_modules:" + directory_text_hash(WRITER_MODULES_DIR))
+    payload.append("chunks_md:" + directory_text_hash(CHUNKS_DIR, "*.md"))
+    payload.append("summaries:" + directory_text_hash(RUNTIME_DIR / "summaries", "*.json"))
+    return text_sha256("\n".join(payload))
+
+
+def stage_meta_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta.json")
+
+
+def draft_cache_deps(chapter: int, beat: Dict[str, Any], writer_prompt: str, run_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "stage": "draft",
+        "chapter": chapter,
+        "beat_hash": stable_json_hash(beat),
+        "writer_prompt_hash": text_sha256(writer_prompt),
+        "chapter_context_hash": chapter_context_hash(),
+        # 生成策略也要进指纹:若本章后来变成关键章/落入高潮窗口（best_of_n→N），
+        # 旧的单采样 draft 不能再当数。策略变 → 指纹变 → 重新择优采样。
+        "gen_strategy_n": best_of_n_enabled(beat, run_cfg),
+    }
+
+
+def review_cache_deps(chapter: int, beat: Dict[str, Any], draft: str, gate: Dict[str, Any], reviewer_prompt: str) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "stage": "review",
+        "chapter": chapter,
+        "beat_hash": stable_json_hash(beat),
+        "draft_hash": text_sha256(draft),
+        "gate_hash": stable_json_hash(gate),
+        "reviewer_prompt_hash": text_sha256(reviewer_prompt),
+        # reviewer 输入还读取 story_director、风格/黑名单、角色台账、近期摘要等。
+        # 这些变了，旧 review 不能套到新上下文上。
+        "review_context_hash": chapter_context_hash(),
+    }
+
+
+def editor_cache_deps(chapter: int, beat: Dict[str, Any], draft: str, gate: Dict[str, Any], review: str, editor_prompt: str) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "stage": "editor",
+        "chapter": chapter,
+        "beat_hash": stable_json_hash(beat),
+        "draft_hash": text_sha256(draft),
+        "gate_hash": stable_json_hash(gate),
+        "review_hash": text_sha256(review),
+        "editor_prompt_hash": text_sha256(editor_prompt),
+    }
+
+
+def write_stage_cache_meta(path: Path, deps: Dict[str, Any], output_text: str) -> None:
+    # read_cached_artifact 会 strip() 后返回；这里也按同一规范 hash，避免尾部换行导致缓存误失效。
+    dump_json(stage_meta_path(path), {
+        "deps": deps,
+        "output_hash": text_sha256((output_text or "").strip()),
+    })
+
+
 def read_cached_artifact(path: Path, min_len: int = 50) -> str:
     """续跑用：读已落盘的阶段产物。非空且达最小长度才算有效缓存，否则返回 ''。
     依据：call_role 只在成功时落盘；cleanup 只在整章成功后执行，失败章的产物得以保留。"""
     txt = read_text(path).strip()
     return txt if len(txt) >= min_len else ""
+
+
+def read_cached_stage(path: Path, deps: Dict[str, Any], min_len: int = 50) -> str:
+    """读取带输入指纹的阶段缓存。只有 sidecar deps + output_hash 都匹配才复用。"""
+    txt = read_cached_artifact(path, min_len=min_len)
+    if not txt:
+        return ""
+    try:
+        meta = load_json(stage_meta_path(path), {})
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not meta or meta.get("deps") != deps:
+        return ""
+    if meta.get("output_hash") != text_sha256(txt):
+        return ""
+    return txt
 
 
 def resume_verdict(chapter: int) -> Dict[str, Any]:
@@ -632,8 +942,10 @@ def generate_chapter_final(
     if pov_character != "沈安":
         cli_print(f"[POV] 第{chapter}章为 POV 章，视角角色：{pov_character}")
 
-    # 续跑：初稿已落盘则跳过最贵的 writer 步，连带跳过构建上下文（可能触发压缩 LLM 调用）
-    cached_draft = read_cached_artifact(role_artifact("writer", chapter, "draft.md")) if resume else ""
+    draft_path = role_artifact("writer", chapter, "draft.md")
+    draft_deps = draft_cache_deps(chapter, beat, writer_prompt, run_cfg)
+    # 续跑：初稿已落盘且输入指纹匹配才跳过最贵的 writer 步，连带跳过构建上下文（可能触发压缩 LLM 调用）
+    cached_draft = read_cached_stage(draft_path, draft_deps) if resume else ""
 
     if cached_draft:
         stage_done(chapter, "writer", "构建上下文", 1, total_steps, started)
@@ -664,11 +976,12 @@ def generate_chapter_final(
                 "writer",
                 writer_prompt,
                 writer_input,
-                role_artifact("writer", chapter, "draft.md"),
+                draft_path,
                 timeout,
                 7000,
                 role_artifact("writer", chapter, "writer_input.md"),
             )
+        write_stage_cache_meta(draft_path, draft_deps, draft)
     stage_done(chapter, "writer", "写初稿", 2, total_steps, started)
     time.sleep(sleep_seconds)
 
@@ -696,7 +1009,9 @@ def generate_chapter_final(
 
     wait_if_paused("Reviewer 评审前")
     started = stage_start(chapter, "reviewer", "评审", 4, total_steps, chapter_index, total_chapters)
-    cached_review = read_cached_artifact(role_artifact("reviewer", chapter, "review.md")) if resume else ""
+    review_path = role_artifact("reviewer", chapter, "review.md")
+    review_deps = review_cache_deps(chapter, beat, draft, gate, reviewer_prompt)
+    cached_review = read_cached_stage(review_path, review_deps) if resume else ""
     if cached_review:
         review = cached_review
         cli_print(f"[续跑] 第{chapter}章复用已有评审，跳过 reviewer。")
@@ -715,11 +1030,12 @@ def generate_chapter_final(
             "reviewer",
             reviewer_prompt,
             review_input,
-            role_artifact("reviewer", chapter, "review.md"),
+            review_path,
             timeout,
             3000,
             role_artifact("reviewer", chapter, "review_input.md"),
         )
+        write_stage_cache_meta(review_path, review_deps, review)
     stage_done(chapter, "reviewer", "评审", 4, total_steps, started)
     time.sleep(sleep_seconds)
 
@@ -735,7 +1051,13 @@ def generate_chapter_final(
             cli_print(f"  阻断:{b}")
 
     final = draft
-    cached_edited = read_cached_artifact(role_artifact("editor", chapter, "edited.md")) if resume else ""
+    editor_prompt = read_text(PROMPTS_DIR / "editor.md") or (
+        "你是修稿手。只做局部手术，不做全文润色。只根据评审意见修正文，不新增世界观，不改变本章核心事件。"
+        "输出完整修订正文。"
+    )
+    editor_path = role_artifact("editor", chapter, "edited.md")
+    editor_deps = editor_cache_deps(chapter, beat, draft, gate, review, editor_prompt)
+    cached_edited = read_cached_stage(editor_path, editor_deps) if resume else ""
     if max_revisions > 0 and ((not gate.get("passed")) or verdict.get("needs_revision")):
         if cached_edited:
             final = cached_edited
@@ -745,28 +1067,45 @@ def generate_chapter_final(
         else:
             wait_if_paused("Editor 修稿前")
             started = stage_start(chapter, "editor", "修稿", 5, total_steps, chapter_index, total_chapters)
-            editor_prompt = (
-                "你是修稿手。只做局部手术，不做全文润色。只根据评审意见修正文，不新增世界观，不改变本章核心事件。"
-                "优先消除AI腔、专名污染、注水、解释型对话、空钩子、长句长段和节奏问题。"
-                "禁止把文字修得更工整、更对称、更像作文。保留短句、残句、沉默、口语毛刺和人物不完美反应。"
-                "如果评审指出方向偏航，只做一个最小修正动作，让它读起来像原本就该这样发展。"
-                "输出完整修订正文。"
-            )
             editor_sections = [
                 make_section("初稿", draft, "critical", False),
+                # 给 editor 本章 beat 摘要:让它核对"writer 有没有漏掉 beat 的核心事件/转折/钩子/
+                # 多角度",而不是只照 reviewer 意见动刀,把本章该有的骨架改没了。
+                make_section("本章 beat（核对忠诚度用，不要凭空加设定）",
+                             json.dumps(sanitize_beat_for_writer(beat), ensure_ascii=False, indent=2),
+                             "high", True),
                 make_section("硬检查/风格检查/连续性检查", json.dumps(gate, ensure_ascii=False, indent=2), "high", False),
                 make_section("评审", review, "high", True),
             ]
+            # 按需注入护栏:editor 输出完整正文且有补段落的权限,但原本看不到台账/空间/声纹,
+            # 补段落时极易穿帮(让耗尽资源复现、写错方位、配角口吻跑偏)。这里复用 writer 的
+            # 按需注入机制,只在 beat 相关时注入对应护栏,不相关就静默,避免撑大 context 稀释注意力。
+            editor_ledger = ledger_context_for_writer(beat)
+            if editor_ledger:
+                editor_sections.append(make_section(
+                    "正典账本（资源/未结清账/约束/本章相关实体与关系——补段落时必须与此一致，不可让耗尽资源复现、不可改实体关系）",
+                    editor_ledger, "critical", False))
+            editor_layout = layout_for_writer(beat)
+            if editor_layout:
+                editor_sections.append(make_section(
+                    "本章空间布局（补段落涉及人物走位/方位时严格遵守，不可与既有布局矛盾）",
+                    editor_layout, "high", True))
+            editor_focus = writer_focus_modules(beat)
+            if editor_focus:
+                editor_sections.append(make_section(
+                    "写作要点模块（仅当需要补/改段落时参考，保持与原文文风、对话口吻一致）",
+                    editor_focus, "high", True))
             editor_input = compress_sections_if_needed("editor", chapter, editor_sections, run_cfg, timeout)
             final = call_role(
                 "editor",
                 editor_prompt,
                 editor_input,
-                role_artifact("editor", chapter, "edited.md"),
+                editor_path,
                 timeout,
                 7000,
                 role_artifact("editor", chapter, "editor_input.md"),
             )
+            write_stage_cache_meta(editor_path, editor_deps, final)
             stage_done(chapter, "editor", "修稿", 5, total_steps, started)
             time.sleep(sleep_seconds)
     else:
@@ -787,16 +1126,22 @@ def generate_chapter_final(
         "type_guard": final_type_guard,
         "satisfaction_check": {"passed": not final_satisfaction, "issues": [], "warnings": final_satisfaction},
     })
+    final_gate["checked_text_sha256"] = text_sha256(final)
     dump_json(role_artifact("gate", chapter, "final_gate.json"), final_gate)
     dump_json(role_artifact("gate", chapter, "final_style_gate.json"), final_style)
     dump_json(role_artifact("gate", chapter, "final_continuity.json"), final_continuity)
     dump_json(role_artifact("gate", chapter, "final_type_guard.json"), final_type_guard)
     if not final_gate.get("passed"):
         cli_print(f"第 {chapter} 章 final 仍有硬检查问题：{'; '.join(final_gate.get('issues') or [])}")
+        # final_gate issues 是必须复核的硬检查问题：客观穿帮 + 已验证的无歧义 AI 腔坏味道。
+        # 首要目的是通宵跑不中断:默认【标记不停机】,把该章记入待复核清单后继续跑下一章。
+        # 只有显式设 fail_on_final_gate=true(白天想严格跑时)才停机。
         if run_cfg.get("fail_on_final_gate", False):
             raise RuntimeError(f"第 {chapter} 章 final_gate 未通过")
+        flag_for_review(chapter, "final_gate硬检查问题", "; ".join(final_gate.get("issues") or []))
 
     # 事实核查员(LLM):拿角色卡逐项核对正文,抓幻觉穿帮
+    residual_factcheck_issues = 0
     # 策略:两轮点对点小修改,第三轮还不过才整章重写。到此为止不循环。
     if not run_cfg.get("skip_fact_check"):
         ledger = load_ledger()
@@ -889,9 +1234,10 @@ def generate_chapter_final(
                             )
                             residual = len(re.findall(r"^\d+\.\s*\[", verify_2, re.MULTILINE)) if verify_2 else 0
                             if residual > 0:
-                                cli_print(f"第 {chapter} 章最终验证:仍有 {residual} 处,接受现状。")
+                                cli_print(f"第 {chapter} 章最终验证:仍有 {residual} 处残留穿帮。")
                                 write_text(role_artifact("gate", chapter, "residual_issues.md"),
                                            f"# 第{chapter}章 残留穿帮\n\n{verify_2}")
+                                residual_factcheck_issues = residual
                             else:
                                 cli_print(f"第 {chapter} 章最终验证:通过。")
                         else:
@@ -905,14 +1251,52 @@ def generate_chapter_final(
             stage_done(chapter, "fact_checker", "事实核查", 6, total_steps, started)
 
     # 清洗:mimo 有时会把思考过程吐到正文前面,只保留 "# 第X章" 开始的内容
-    # 也匹配模型原样复制模板占位符的情况 (# 第{N}章)
-    chapter_heading = re.search(r"^#\s*第(?:\d+|\{N\})章", final, re.MULTILINE)
+    # 也匹配模型原样复制模板占位符的情况 (# 第{N}章),以及中文数字标题(# 第八十七章)
+    heading_re = r"^#\s*第(?:[0-9]+|[一二三四五六七八九十百千零两]+|\{N\})章"
+    chapter_heading = re.search(heading_re, final, re.MULTILINE)
     if chapter_heading:
         final = final[chapter_heading.start():]
-    # 强制修正标题行：模型可能输出模板占位符或漏掉标题
+    # 强制修正标题行：模型可能输出模板占位符、中文数字或漏掉标题
     title = beat.get("标题") or ""
     correct_heading = f"# 第{chapter}章 {title}".rstrip()
-    final = re.sub(r"^#\s*第(?:\d+|\{N\})章[^\n]*", correct_heading, final, count=1, flags=re.MULTILINE)
+    final = re.sub(heading_re + r"[^\n]*", lambda _m: correct_heading, final, count=1, flags=re.MULTILINE)
+
+    # 残留穿帮:事实核查跑完两轮+最终验证仍有客观穿帮。首要目的是通宵跑不中断,
+    # 默认【标记不停机】——记入待复核清单后照常落盘继续跑,绝不因一次 LLM 误报半夜停机。
+    # 只有显式设 fail_on_final_gate=true 才停机。
+    if residual_factcheck_issues > 0:
+        if run_cfg.get("fail_on_final_gate", False):
+            raise RuntimeError(
+                f"第 {chapter} 章事实核查残留 {residual_factcheck_issues} 处穿帮,显式阻断(详见 residual_issues.md)。"
+                f"修复后重跑会从本章续上。"
+            )
+        flag_for_review(chapter, "事实核查残留穿帮",
+                        f"残留 {residual_factcheck_issues} 处,详见 residual_issues.md")
+
+    committed_gate = final_gate_for_text(final, chapter, beat)
+    committed_hash = committed_gate.get("checked_text_sha256")
+    initial_gate_hash = final_gate.get("checked_text_sha256")
+    dump_json(role_artifact("gate", chapter, "committed_gate.json"), committed_gate)
+    dump_json(role_artifact("gate", chapter, "final_committed.json"), {
+        "chapter": chapter,
+        "manuscript": str(manuscript_path(chapter)),
+        "writer_final": str(role_artifact("writer", chapter, "final.md")),
+        "final_text_sha256": committed_hash,
+        # A1 续跑的 provenance:记下成文时用的 beat 指纹。下次只剩正文需补台账时，
+        # 可据此判断这份已提交正文是否还对应当前 beat（不据此推倒重来，只用于标记复核）。
+        "beat_hash": stable_json_hash(beat),
+        "initial_final_gate_checked_sha256": initial_gate_hash,
+        "initial_final_gate_matches_committed": initial_gate_hash == committed_hash,
+        "committed_gate_passed": bool(committed_gate.get("passed")),
+        "committed_gate_issue_count": len(committed_gate.get("issues") or []),
+        "residual_factcheck_issues": residual_factcheck_issues,
+    })
+    if not committed_gate.get("passed"):
+        cli_print(f"第 {chapter} 章提交态 final 仍有硬检查问题：{'; '.join(committed_gate.get('issues') or [])}")
+        if run_cfg.get("fail_on_final_gate", False):
+            raise RuntimeError(f"第 {chapter} 章 committed_gate 未通过")
+        if committed_hash != initial_gate_hash or committed_gate.get("issues") != final_gate.get("issues"):
+            flag_for_review(chapter, "committed_final硬检查问题", "; ".join(committed_gate.get("issues") or []))
 
     write_text(role_artifact("writer", chapter, "final.md"), final)
     write_text(manuscript_path(chapter), final)
@@ -939,7 +1323,42 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
     have_final = resume and len(re.findall(r'[一-鿿]', final)) >= min_chars
     if have_final:
         cli_print(f"[续跑] 第{chapter}章正文已存在，跳过生成阶段，直接补台账。")
+        # A1 provenance 校验:成文当时把 beat_hash 记在 final_committed.json。
+        # 若现在的 beat 与成文时不一致（beat 被改/重排），不推倒重来（用户要"断哪续哪"），
+        # 但要标记复核——否则这份正文会以陈旧 beat 的身份静默补进台账，无从 debug。
+        prev_commit = load_json(role_artifact("gate", chapter, "final_committed.json"), {})
+        prior_beat_hash = prev_commit.get("beat_hash")
+        cur_beat_hash = stable_json_hash(beat)
+        if prior_beat_hash and prior_beat_hash != cur_beat_hash:
+            cli_print(f"第 {chapter} 章续跑:正文成文时的 beat 与当前 beat 不一致，已标记复核（不重写正文）。")
+            flag_for_review(chapter, "resume正文与当前beat不一致",
+                            f"成文 beat_hash={prior_beat_hash[:12]}，当前={cur_beat_hash[:12]}；正文已落盘按用户要求不推倒重来，请人工确认是否需重写。")
+        # 旧失败现场可能只有 输出/文章/第NNN章.md，没有 writer/final.md 或提交态门禁凭证。
+        # A1 续跑不重跑 LLM，但要把这些纯代码产物补齐，维持“正文=提交态凭证”不变量。
+        write_text(role_artifact("writer", chapter, "final.md"), final)
+        committed_gate = final_gate_for_text(final, chapter, beat)
+        dump_json(role_artifact("gate", chapter, "committed_gate.json"), committed_gate)
+        dump_json(role_artifact("gate", chapter, "final_committed.json"), {
+            "chapter": chapter,
+            "manuscript": str(manuscript_path(chapter)),
+            "writer_final": str(role_artifact("writer", chapter, "final.md")),
+            "final_text_sha256": committed_gate.get("checked_text_sha256"),
+            "beat_hash": cur_beat_hash,
+            "initial_final_gate_checked_sha256": None,
+            "initial_final_gate_matches_committed": None,
+            "committed_gate_passed": bool(committed_gate.get("passed")),
+            "committed_gate_issue_count": len(committed_gate.get("issues") or []),
+            "residual_factcheck_issues": None,
+            "resume_from_manuscript": True,
+        })
+        if not committed_gate.get("passed"):
+            cli_print(f"第 {chapter} 章续跑提交态仍有硬检查问题：{'; '.join(committed_gate.get('issues') or [])}")
+            if run_cfg.get("fail_on_final_gate", False):
+                raise RuntimeError(f"第 {chapter} 章 committed_gate 未通过")
+            flag_for_review(chapter, "resume_committed_final硬检查问题", "; ".join(committed_gate.get("issues") or []))
         verdict = resume_verdict(chapter)
+        if verdict.get("source") == "resume_default":
+            flag_for_review(chapter, "resume缺少reviewer判定", "正文已落盘但缺少 review_verdict.json/review.md，已用默认 verdict 补台账。")
     else:
         result = generate_chapter_final(
             chapter, beat, pov_character, run_cfg,
@@ -949,11 +1368,16 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
             return
         final, verdict = result
 
-    # 写手摘要：轻量 LLM 调用，记录本章表达特征供后续章防重复
+    # 写手摘要：轻量 LLM 调用，记录本章表达特征供后续章防重复。
+    # 续跑时若摘要已落盘，不重复调用 summarizer；否则 archivist 挂了之后外层重试
+    # 会在补台账前先反复生成摘要，违背“断在哪里就从哪里重新开始”。
     if not run_cfg.get("skip_summarizer"):
         try:
-            generate_chapter_summary(chapter, final, timeout)
-            cli_print(f"[summarizer] 第{chapter}章写手摘要已生成。")
+            if resume and summary_path(chapter).exists():
+                cli_print(f"[summarizer] 第{chapter}章摘要已存在，续跑跳过。")
+            else:
+                generate_chapter_summary(chapter, final, timeout)
+                cli_print(f"[summarizer] 第{chapter}章写手摘要已生成。")
         except Exception as exc:
             cli_print(f"[summarizer] 第{chapter}章摘要生成失败（不影响正文）：{exc}")
 
@@ -1034,6 +1458,15 @@ def run_one_chapter(chapter: int, beat_path: Path, run_cfg: Dict[str, Any], chap
     seconds = int(elapsed_total % 60)
     score = verdict.get("total", "?")
     cli_print(f"═══ 章 {chapter} 完成 │ {minutes}m{seconds:02d}s │ 评分 {score}/60 │ {manuscript_path(chapter).name} ═══")
+    # 本章真实 token 用量汇总(只读统计)
+    u = usage_summary(reset=False)
+    t = u["totals"]
+    if t["total"]:
+        cli_print(f"─── 第{chapter}章 token 用量 ───")
+        for role, v in sorted(u["by_role"].items(), key=lambda x: -x[1]["total"]):
+            cache_note = f"(缓存{v['cached']:,})" if v.get("cached") else ""
+            cli_print(f"    {role:<14} 输入{v['input']:>8,} 输出{v['output']:>7,} 合计{v['total']:>8,} ×{v['calls']}次 {cache_note}")
+        cli_print(f"    {'合计':<14} 输入{t['input']:>8,} 输出{t['output']:>7,} 合计{t['total']:>8,} 缓存命中{t['cached']:,}")
 
 
 # ========================= 分析师·全量扫读管线(一劳永逸) =========================
@@ -1724,6 +2157,9 @@ def main() -> None:
             if STOP_FILE.exists():
                 cli_print("检测到停止请求，退出。")
                 break
+            # 重置本章 token 累加器:从这里到本章结束的所有角色调用(beat/arc/director/
+            # writer/reviewer/editor/factchecker/archivist/summarizer)都计入本章成本。
+            usage_summary(reset=True)
             timeout = int(run_cfg.get("request_timeout_seconds") or 240)
             # 单章用重试+退避包裹:一次网络抖动不该让整夜任务全死。
             chapter_ok = False

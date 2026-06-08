@@ -51,10 +51,15 @@
   "sleep_seconds_between_calls": 1,
   "dry_run": false,
   "best_of_n": {
-   "enabled": false,
-   "_comment": "默认关闭。费token(writer×n)。开启后仅在关键/高潮章触发:beat标注关键章/高潮章 或 章号在key_chapters里。打分用免费code检查(gate+反自我重复),reviewer/editor仍只跑赢家一次。",
+   "enabled": true,
+   "_comment": "已开启。费token(writer×n)。仅在关键/高潮章触发:beat标注关键章/高潮章且落在arc高潮窗口±1内(双签护栏) 或 章号在key_chapters白名单里。打分用免费code检查(gate+反自我重复),reviewer/editor仍只跑赢家一次。平常章不触发,成本可控。",
    "n": 3,
    "key_chapters": []
+  },
+  "arc_output_audit": {
+   "enabled": true,
+   "max_retries": 1,
+   "_comment": "弧线产出后做确定性体检:mimo 常偷掉 prompt 必填的结构化产出(pov_decision自查字段、章内多角度 in_chapter_angles)。检测到缺失→用点名缺项的强化指令重调 arc_planner 一次,再缺则告警放行。arc_planner 非每章跑(弧线级),max_retries=1 硬封顶,守通宵不停机铁律。设 false 关闭即退回纯告警。"
   }
  }
 }

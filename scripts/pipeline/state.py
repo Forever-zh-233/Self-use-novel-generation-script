@@ -219,8 +219,9 @@ def _foreshadowing_digest_lines(threads: Dict[str, Any], chapter: int = 0,
     unresolved = [
         (k, v) for k, v in fs.items()
         if isinstance(v, dict)
-        and v.get("status") not in ("已回收", "已结", "部分回收")
-        and not v.get("resolved_chapter")
+        and v.get("status") not in ("已回收", "已结")
+        # 部分回收有 remaining_promise = 还欠读者的承诺,不能因 resolved_chapter 踢出视野
+        and (not v.get("resolved_chapter") or v.get("remaining_promise"))
     ]
     if not unresolved:
         return ["## 未回收伏笔\n（暂无）"]
@@ -321,7 +322,7 @@ def structured_state_for_planner(chapter: int) -> str:
     strand = raw_state.get("strand_tracker") or {}
     if strand.get("history"):
         recent_strands = strand["history"][-5:]
-        strand_str = "、".join(f"第{s.get('chapter','?')}章={s.get('strand','?')}" for s in recent_strands)
+        strand_str = "、".join(f"第{s.get('chapter','?')}章={s.get('dominant') or s.get('strand') or '?'}" for s in recent_strands)
         lines.append(f"【三线节奏】{strand_str}")
 
     threads = load_active_threads()
@@ -506,6 +507,12 @@ def volume_summary(chapter: int) -> str:
         parts.append("## 全书发展历程")
         for i, vol in enumerate(digests["volumes"], 1):
             ch = vol.get("volume_end_chapter", "?")
+            # 过滤未来态:章号大于当前章的卷摘要不注入(防止提前写入/手动编辑的未来卷污染规划)
+            try:
+                if int(ch) > chapter:
+                    continue
+            except (ValueError, TypeError):
+                pass
             parts.append(f"### 第{i}卷(截至第{ch}章)")
             parts.append(vol.get("digest", "(无摘要)"))
             parts.append("")

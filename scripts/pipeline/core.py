@@ -374,6 +374,35 @@ def cleanup_chapter_artifacts(chapter: int, run_cfg: Dict[str, Any]) -> None:
         "final_gate.json",
         "final_style_gate.json",
         "final_continuity.json",
+        "needs_review.md",
+        "residual_issues.md",
+    }
+    keep_audit_chain = {
+        "gate.json",
+        "style_gate.json",
+        "continuity.json",
+        "type_guard.json",
+        "review_input.md",
+        "review.md",
+        "review_verdict.json",
+        "editor_input.md",
+        "edited.md",
+        "final.md",
+        "fact_fix_1.md",
+        "fact_fix_2.md",
+        "final_gate.json",
+        "final_style_gate.json",
+        "final_continuity.json",
+        "final_type_guard.json",
+        "committed_gate.json",
+        "final_committed.json",
+        "fact_check.md",
+        "verify_1.md",
+        "verify_2.md",
+        "archive_input.md",
+        "archive_update.md",
+        "needs_review.md",
+        "residual_issues.md",
     }
     deleted = 0
     for role in ["beat", "writer", "gate", "reviewer", "editor", "archivist", "context"]:
@@ -384,6 +413,8 @@ def cleanup_chapter_artifacts(chapter: int, run_cfg: Dict[str, Any]) -> None:
             if not path.is_file() or not path.name.startswith(prefix):
                 continue
             suffix = path.name[len(prefix):]
+            if suffix in keep_audit_chain or suffix.endswith(".meta.json"):
+                continue
             if mode == "reports" and suffix in keep_when_reports:
                 continue
             try:

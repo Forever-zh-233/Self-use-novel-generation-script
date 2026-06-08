@@ -131,6 +131,55 @@ def http_post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: 
         raise error
     return result_box["ok"]
 
+def extract_usage(data: Dict[str, Any]) -> Dict[str, int]:
+    """从 API 返回里提取真实 token 用量，兼容三种 provider 的字段命名。
+    openai_chat(mimo): prompt_tokens/completion_tokens, 缓存命中在 prompt_tokens_details.cached_tokens。
+    openai_responses/anthropic: input_tokens/output_tokens, 缓存在 cache_read_input_tokens 或 input_tokens_details.cached_tokens。
+    返回 {input, output, cached, total}，取不到的字段为 0。"""
+    u = data.get("usage") or {}
+    if not isinstance(u, dict):
+        return {"input": 0, "output": 0, "cached": 0, "total": 0}
+    inp = u.get("prompt_tokens") or u.get("input_tokens") or 0
+    out = u.get("completion_tokens") or u.get("output_tokens") or 0
+    # 缓存命中:各家字段不同,挨个试
+    cached = (
+        u.get("cache_read_input_tokens")
+        or (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+        or (u.get("input_tokens_details") or {}).get("cached_tokens")
+        or u.get("cached_tokens")
+        or 0
+    )
+    total = u.get("total_tokens") or (int(inp) + int(out))
+    return {"input": int(inp), "output": int(out), "cached": int(cached), "total": int(total)}
+
+
+# 全程 token 用量累加器:{role: {input, output, cached, total, calls}}。
+# 只读统计,不影响任何业务逻辑。run_pipeline 可在每章末/收尾打印汇总。
+USAGE_TALLY: Dict[str, Dict[str, int]] = {}
+
+
+def _accumulate_usage(role: str, usage: Dict[str, int]) -> None:
+    slot = USAGE_TALLY.setdefault(role, {"input": 0, "output": 0, "cached": 0, "total": 0, "calls": 0})
+    slot["input"] += usage["input"]
+    slot["output"] += usage["output"]
+    slot["cached"] += usage["cached"]
+    slot["total"] += usage["total"]
+    slot["calls"] += 1
+
+
+def usage_summary(reset: bool = False) -> Dict[str, Any]:
+    """汇总当前累加的 token 用量。reset=True 时清零(用于按章统计)。
+    返回 {by_role, totals}。"""
+    by_role = {r: dict(v) for r, v in USAGE_TALLY.items()}
+    totals = {"input": 0, "output": 0, "cached": 0, "total": 0, "calls": 0}
+    for v in USAGE_TALLY.values():
+        for k in totals:
+            totals[k] += v.get(k, 0)
+    if reset:
+        USAGE_TALLY.clear()
+    return {"by_role": by_role, "totals": totals}
+
+
 def extract_responses_text(data: Dict[str, Any]) -> str:
     if isinstance(data.get("output_text"), str):
         return data["output_text"]
@@ -258,6 +307,12 @@ def call_model(role: str, instructions: str, input_text: str, max_output_tokens:
         raise OutputTruncated(
             f"角色 {role} 输出在 {max_output_tokens} token 上限处被截断。", partial=text
         )
+    # 真实 token 用量(只读旁路,不影响返回):打印本次 + 累加到本章/全程计数器
+    usage = extract_usage(data)
+    if usage["total"]:
+        cached_str = f" │ 缓存命中 {usage['cached']:,}" if usage["cached"] else ""
+        cli_print(f"  ← {role} │ 实耗 输入 {usage['input']:,} / 输出 {usage['output']:,} = {usage['total']:,} tok{cached_str}")
+        _accumulate_usage(role, usage)
     return text
 
 

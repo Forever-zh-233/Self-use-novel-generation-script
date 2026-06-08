@@ -33,8 +33,13 @@ _x*.md
 分析草稿/
 台账版本/
 _重生备份_*/
+_重生备份/
 temp_章纲/
 scripts/run_pipeline_backup.py
+
+# === 本地工具 / API 代理脚本（含本地环境，不纳入版本）===
+scripts/openaidns_claude_bridge.ps1
+*_claude_bridge.ps1
 
 # === Python 缓存 ===
 __pycache__/

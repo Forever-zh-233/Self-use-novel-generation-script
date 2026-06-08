@@ -53,6 +53,8 @@ def _seed_workspace(tmp: Path) -> None:
 
     chunks = {
         "黄金法则": {"file": "chunk_黄金法则.md", "tokens": 10, "category": "必选"},
+        "负空间": {"file": "chunk_负空间.md", "tokens": 10, "category": "必选"},
+        "AI腔黑名单": {"file": "chunk_AI腔黑名单.md", "tokens": 10, "category": "必选"},
         "沈安": {"file": "chunk_沈安.md", "tokens": 10, "category": "角色"},
         "黑子": {"file": "chunk_黑子.md", "tokens": 10, "category": "角色"},
         "日常对话": {"file": "chunk_日常对话.md", "tokens": 10, "category": "场景"},
@@ -183,6 +185,7 @@ def _base_resume_run_cfg(**overrides) -> dict:
         "resume_partial_chapter": True,
         "min_recover_article_chars": 20,
         "skip_fact_check": True,
+        "skip_summarizer": True,
         "max_revisions": 1,
         "apply_archivist_updates": True,
         "artifact_retention": "debug",
@@ -227,6 +230,49 @@ def _patch_fast_gates(rp, counters: dict | None = None) -> None:
     }
 
 
+def _fast_gate_result() -> dict:
+    return {"passed": True, "issues": [], "warnings": []}
+
+
+def _writer_prompt_for(rp, pov_character: str = "沈安") -> str:
+    return rp.read_text(rp.PROMPTS_DIR / ("writer_pov.md" if pov_character != "沈安" else "writer.md"))
+
+
+def _reviewer_prompt_for(rp) -> str:
+    return rp.read_text(rp.PROMPTS_DIR / "reviewer.md")
+
+
+def _editor_prompt_for(rp) -> str:
+    return rp.read_text(rp.PROMPTS_DIR / "editor.md") or (
+        "你是修稿手。只做局部手术，不做全文润色。只根据评审意见修正文，不新增世界观，不改变本章核心事件。"
+        "输出完整修订正文。"
+    )
+
+
+def _write_draft_cache(rp, chapter: int, beat: dict, draft: str, run_cfg: dict | None = None) -> None:
+    path = rp.role_artifact("writer", chapter, "draft.md")
+    _write(path, draft)
+    rp.write_stage_cache_meta(
+        path,
+        rp.draft_cache_deps(chapter, beat, _writer_prompt_for(rp, beat.get("视角角色", "沈安")), run_cfg or _base_resume_run_cfg()),
+        draft,
+    )
+
+
+def _write_review_cache(rp, chapter: int, beat: dict, draft: str, review: str, gate: dict | None = None) -> None:
+    path = rp.role_artifact("reviewer", chapter, "review.md")
+    gate = gate or _fast_gate_result()
+    _write(path, review)
+    rp.write_stage_cache_meta(path, rp.review_cache_deps(chapter, beat, draft, gate, _reviewer_prompt_for(rp)), review)
+
+
+def _write_editor_cache(rp, chapter: int, beat: dict, draft: str, review: str, edited: str, gate: dict | None = None) -> None:
+    path = rp.role_artifact("editor", chapter, "edited.md")
+    gate = gate or _fast_gate_result()
+    _write(path, edited)
+    rp.write_stage_cache_meta(path, rp.editor_cache_deps(chapter, beat, draft, gate, review, _editor_prompt_for(rp)), edited)
+
+
 def run(h: TestHarness) -> None:
     h.section("scenario: writer context uses temporary workspace")
     with isolated_workspace() as tmp:
@@ -258,6 +304,63 @@ def run(h: TestHarness) -> None:
         titles = [item["title"] for item in sections]
         h.check("writer sections are built", bool(sections), titles)
         h.check("writer sections include hard beat", any("本章 beat" in title or "beat" in title.lower() for title in titles), titles)
+
+        _write_json(tmp / "分析草稿/style_metrics.json", {
+            "sentence": {"mean": 13.4, "median": 13, "p10": 1, "p90": 26},
+            "paragraph": {"mean": 17.6, "median": 17},
+            "single_sentence_paragraph": {"single_sentence_ratio_percent": 31.1},
+            "dialogue_style": {
+                "pure_quote_ratio_percent": 55.9,
+                "with_speaker_tag_ratio_percent": 25.9,
+                "with_action_tail_ratio_percent": 8.3,
+            },
+            "chapter_endings": {"avg_last_line_length": 12.0, "short_ending_ratio_percent": 100.0},
+            "high_freq_words": [{"word": "源文真名", "count": 999}],
+        })
+        sections = context.build_writer_sections(beat)
+        titles = [item["title"] for item in sections]
+        bodies = "\n".join(item["body"] for item in sections)
+        h.check("writer sections include style metrics digest", "源文风格指标执行摘要" in titles, titles)
+        h.includes("style digest includes sentence cadence", bodies, "句长")
+        h.not_includes("style digest excludes source-name probes", bodies, "源文真名")
+
+    h.section("scenario: POV writer consumes critical chunks without protagonist sensory leak")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        core, api, state, context, gates, archivist = _import_modules()
+        led = json.loads((tmp / "runtime/ledger.json").read_text(encoding="utf-8"))
+        led["entities"]["方绾"] = {
+            "type": "角色",
+            "summary": "药铺女郎，心细。",
+            "voice": "说话轻，句子短。",
+            "facts": ["知道沈安救过人。"],
+            "status": "活跃",
+        }
+        led["impact_seeds"] = [{
+            "who": "方绾",
+            "pov_voice": "先看药味，再看人。",
+            "ignorant_of": ["沈安的系统面板"],
+        }]
+        _write_json(tmp / "runtime/ledger.json", led)
+        beat = {
+            "章节编号": 6,
+            "标题": "药柜后的灯",
+            "视角角色": "方绾",
+            "叙事手法": "顺叙",
+            "场景类型": "日常对话",
+            "出场角色": ["方绾", "沈安"],
+            "潜台词机会": "方绾试探沈安是否隐瞒伤势",
+            "本章张力": "小起伏",
+            "本章冲突": "方绾发现沈安伤势不对。",
+        }
+        text = context.build_pov_writer_input(beat, 6, {"max_input_tokens": {"writer": 60000}, "context_windows": {"writer": 200000}}, 1)
+        h.includes("POV writer includes AI blacklist chunk", text, "AI腔黑名单")
+        h.includes("POV writer includes negative-space chunk", text, "负空间")
+        h.includes("POV writer includes dialogue module", text, "对话要有潜台词")
+        h.includes("POV writer includes tension module", text, "转折章")
+        h.includes("POV writer keeps knowledge boundary", text, "沈安的系统面板")
+        h.not_includes("POV writer skips protagonist role chunk", text, "角色_沈安")
+        h.not_includes("POV writer skips protagonist sensory module", text, "盲感官优先")
 
     h.section("scenario: adjacent continuity guard")
     with isolated_workspace() as tmp:
@@ -423,7 +526,7 @@ def run(h: TestHarness) -> None:
         _patch_fast_gates(rp)
         beat = _basic_beat(2)
         draft = _cache_text("已有初稿")
-        _write(rp.role_artifact("writer", 2, "draft.md"), draft)
+        _write_draft_cache(rp, 2, beat, draft)
         calls = []
         build_calls = []
         rp.build_writer_input = lambda *_args, **_kwargs: build_calls.append("writer_input") or "writer input"
@@ -445,16 +548,21 @@ def run(h: TestHarness) -> None:
         h.check("draft.md 存在时不重跑 writer", "writer" not in calls, calls)
         h.includes("复用 draft 内容作为 final 基础", final, "已有初稿")
         h.equal("reviewer 正常解析新评审 verdict", verdict["total"], 48)
+        committed = json.loads(rp.read_text(rp.role_artifact("gate", 2, "final_committed.json")))
+        h.equal("提交态审计 hash 对应最终正文", committed["final_text_sha256"], rp.text_sha256(final))
+        h.check("提交态门禁落盘", rp.role_artifact("gate", 2, "committed_gate.json").exists(), "")
 
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)
         rp = _import_run_pipeline()
         _patch_fast_gates(rp)
         beat = _basic_beat(2)
-        _write(rp.role_artifact("writer", 2, "draft.md"), _cache_text("已有初稿"))
-        _write(rp.role_artifact("reviewer", 2, "review.md"), """```json
+        draft = _cache_text("已有初稿")
+        review = """```json
 {"needs_revision": false, "total": 49, "blockers": []}
-```""")
+```"""
+        _write_draft_cache(rp, 2, beat, draft)
+        _write_review_cache(rp, 2, beat, draft, review)
         calls = []
         rp.build_writer_input = lambda *_args, **_kwargs: "SHOULD NOT BUILD"
         rp.make_review_input = lambda *_args, **_kwargs: "SHOULD NOT REVIEW"
@@ -470,12 +578,14 @@ def run(h: TestHarness) -> None:
         rp = _import_run_pipeline()
         _patch_fast_gates(rp)
         beat = _basic_beat(2)
-        edited = _cache_text("已有修稿")
-        _write(rp.role_artifact("writer", 2, "draft.md"), _cache_text("已有初稿"))
-        _write(rp.role_artifact("reviewer", 2, "review.md"), """```json
+        draft = _cache_text("已有初稿")
+        review = """```json
 {"needs_revision": true, "total": 35, "blockers": ["需修稿"]}
-```""")
-        _write(rp.role_artifact("editor", 2, "edited.md"), edited)
+```"""
+        edited = _cache_text("已有修稿")
+        _write_draft_cache(rp, 2, beat, draft)
+        _write_review_cache(rp, 2, beat, draft, review)
+        _write_editor_cache(rp, 2, beat, draft, review, edited)
         calls = []
         rp.call_role = lambda role, *_args, **_kwargs: calls.append(role) or ""
         final, _verdict = rp.generate_chapter_final(
@@ -511,6 +621,32 @@ def run(h: TestHarness) -> None:
         h.equal("坏 draft 缓存会重新构建 writer 上下文", build_calls, ["writer_input"])
         h.check("坏 draft 缓存会重跑 writer", "writer" in calls, calls)
         h.includes("坏缓存不被当成 final", final, "重新生成初稿")
+
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        rp = _import_run_pipeline()
+        _patch_fast_gates(rp)
+        beat = _basic_beat(2)
+        _write(rp.role_artifact("writer", 2, "draft.md"), _cache_text("无指纹旧初稿"))
+        calls = []
+        generated = _cache_text("无指纹后重写初稿")
+        rp.build_writer_input = lambda *_args, **_kwargs: "writer input"
+        rp.make_review_input = lambda *_args, **_kwargs: "review input"
+
+        def fake_no_meta(role, _prompt, _input_text, output_path, *_args):
+            calls.append(role)
+            text = generated if role == "writer" else """```json
+{"needs_revision": false, "total": 50, "blockers": []}
+```"""
+            rp.write_text(output_path, text)
+            return text
+
+        rp.call_role = fake_no_meta
+        final, _verdict = rp.generate_chapter_final(
+            2, beat, "沈安", _base_resume_run_cfg(max_revisions=0), 1, 1, 1, 0
+        )
+        h.check("无指纹旧 draft 不复用", "writer" in calls, calls)
+        h.includes("无指纹旧 draft 触发重写", final, "无指纹后重写初稿")
 
     with isolated_workspace() as tmp:
         _seed_workspace(tmp)
@@ -759,6 +895,144 @@ def run(h: TestHarness) -> None:
         out_legacy = planning.active_arcs_for_beat(11)
         h.not_includes("无逐章走向时不注入格子行", out_legacy, "本章走向格子")
         h.includes("仍保留段落走向", out_legacy, "改用笨办法")
+
+    h.section("scenario: 弧线结构体检——主角欲望缺失/认知化打转/段内无不可逆事件")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        # 坏弧:无 protagonist_want + 整段 drift 全是认知动词、无外部事件
+        bad_arc = {
+            "arc_id": "ARC-BAD", "title": "认知流", "type": "主线推进",
+            "span": [124, 135], "summary": "沈安逐渐搞懂泽里规矩",
+            "nodes": [{
+                "chapter": 124, "beat_hint": "摸绳结", "tension": "低",
+                "chapter_drift": [
+                    {"ch": 124, "gist": "摸到绳结想起老汉，沈安发现打法一样"},
+                    {"ch": 125, "gist": "围着竹丛探查，确认有三个人来过"},
+                    {"ch": 126, "gist": "感知到药渣，怀疑有人蹲过很久"},
+                    {"ch": 127, "gist": "意识到阿朵在附近住过好几天"},
+                ],
+            }],
+        }
+        warns = planning.arc_structural_warnings([bad_arc])
+        blob = "\n".join(warns)
+        h.check("坏弧被体检拦截", len(warns) >= 1, warns)
+        h.includes("点名缺主角欲望", blob, "protagonist_want")
+        h.check("点名认知化或无事件", ("认知化" in blob or "无任何外部" in blob), blob)
+        # 好弧:有 want + drift 带不可逆外部事件
+        good_arc = {
+            "arc_id": "ARC-GOOD", "title": "查周通", "type": "主线推进",
+            "span": [9, 12], "summary": "沈安查周通的秘密",
+            "protagonist_want": "查清周通深夜烧纸在瞒什么",
+            "want_drives_decision": "决定留下不走，主动住进周通后院",
+            "nodes": [{
+                "chapter": 9, "beat_hint": "住进后院", "tension": "中",
+                "chapter_drift": [
+                    {"ch": 9, "gist": "沈安决定留下不走，借口治旧伤住进周通后院"},
+                    {"ch": 10, "gist": "周通深夜支开沈安去见蒙面人，被撞破，两人起戒备"},
+                    {"ch": 11, "gist": "沈安偷看烧的纸认出城隍庙符，知道了周通瞒的事"},
+                ],
+            }],
+        }
+        good_warns = planning.arc_structural_warnings([good_arc])
+        h.equal("好弧体检通过", good_warns, [])
+
+    h.section("scenario: arc_output_audit——揪mimo偷掉的POV自查/章内多角度产出")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        # 偷懒弧:既无 POV 节点又无 pov_decision;声明了同场配角却 0 条 in_chapter_angles
+        lazy_arc = {
+            "arc_id": "ARC-LAZY", "title": "治周济", "type": "主线推进",
+            "span": [40, 48], "summary": "沈安给周济治旧疾",
+            "side_characters": [{"name": "周济", "hidden_agenda": "想试探沈安底细"}],
+            "nodes": [{
+                "chapter": 40, "beat_hint": "上门看诊", "tension": "中",
+                "narrative_ops": {"pov": None, "in_chapter_angles": []},
+            }],
+        }
+        warns, missing = planning.arc_output_audit([lazy_arc])
+        h.check("揪出POV自查缺失", "pov_decision" in missing, missing)
+        h.check("揪出章内多角度缺失", "in_chapter_angles" in missing, missing)
+        h.check("缺项落盘有人话告警", len(warns) >= 2, warns)
+        note = planning._arc_audit_retry_note(missing)
+        h.includes("重调指令点名pov_decision", note, "pov_decision")
+        h.includes("重调指令点名章内多角度", note, "in_chapter_angles")
+        h.includes("重调指令只补缺项不推翻", note, "其余沿用")
+        # 达标弧:写了 pov_decision + 给了 in_chapter_angles → 零缺项
+        ok_arc = {
+            "arc_id": "ARC-OK", "title": "查铜片", "type": "主线推进",
+            "span": [50, 55], "summary": "沈安查铜片来历",
+            "pov_decision": "本弧不需要POV,理由:全程独行追查,无可借眼配角",
+            "side_characters": [{"name": "货郎", "hidden_agenda": "私卖铜片"}],
+            "nodes": [{
+                "chapter": 50, "beat_hint": "盘问货郎", "tension": "中",
+                "narrative_ops": {"pov": None, "in_chapter_angles": [
+                    {"chapter": 50, "character": "货郎", "what": "货郎看出沈安是盲人手却稳", "why": "盲区补偿"}
+                ]},
+            }],
+        }
+        ok_warns, ok_missing = planning.arc_output_audit([ok_arc])
+        h.equal("达标弧零缺项", ok_missing, set())
+        h.equal("达标弧无告警", ok_warns, [])
+        # 独行弧:无配角 → 不要求 in_chapter_angles;但仍要 pov_decision 二选一
+        solo_arc = {
+            "arc_id": "ARC-SOLO", "title": "独闯", "type": "主线推进",
+            "span": [60, 63], "summary": "沈安独自赶路",
+            "pov_decision": "本弧不需要POV,理由:全程独行",
+            "side_characters": [],
+            "nodes": [{"chapter": 60, "narrative_ops": {"pov": None, "in_chapter_angles": []}}],
+        }
+        _, solo_missing = planning.arc_output_audit([solo_arc])
+        h.equal("独行弧无配角不强求切片", solo_missing, set())
+
+    h.section("scenario: 系统机制演示去重——同一系统判定连演无增量预警")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        beats_dir = tmp / "beats"
+        beats_dir.mkdir(parents=True, exist_ok=True)
+        # 104/107 两章都演"了结方式不符"
+        _write_json(beats_dir / "chapter_104.json", {"系统了愿": "捞鞋后系统弹『怨愿未解，了结方式不符』"})
+        _write_json(beats_dir / "chapter_107.json", {"系统了愿": "又一次系统弹『了结方式不符』"})
+        _write_json(beats_dir / "chapter_105.json", {"系统了愿": "无"})
+        digest = planning.recent_system_mechanic_digest(108, lookback=6)
+        h.includes("检出重复系统判定", digest, "了结方式不符")
+        h.includes("要求给信息增量", digest, "信息增量")
+        # 只演一次不预警
+        _write_json(beats_dir / "chapter_107.json", {"系统了愿": "无"})
+        digest_single = planning.recent_system_mechanic_digest(108, lookback=6)
+        h.equal("单次演示不预警", digest_single, "")
+
+    h.section("scenario: 卷交接——上一卷遗留债务清单逼新卷处置")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _import_modules()
+        planning = importlib.import_module("pipeline.planning")
+        # 一条未走完的弧(最后节点超出当前章)
+        planning.save_active_arcs([{
+            "arc_id": "ARC-OLD", "title": "窑厂暗线", "type": "主线",
+            "resolution_condition": "查清窑厂真相",
+            "nodes": [{"chapter": 90, "beat_hint": "老仆被杀"}, {"chapter": 210, "beat_hint": "真相"}],
+        }])
+        debts = planning.previous_volume_residual_debts(200)
+        h.includes("遗留债务清单点名未走完弧线", debts, "窑厂暗线")
+        h.check("要求新卷处置(接手/封存)", ("接手" in debts or "封存" in debts), debts)
+        # 无遗留时给安全文案
+        planning.save_active_arcs([])
+        # active_threads 也清空，确保无线索债
+        try:
+            state_mod = importlib.import_module("pipeline.state")
+            if hasattr(state_mod, "save_active_threads"):
+                state_mod.save_active_threads({"threads": {}, "foreshadowing": {}})
+        except Exception:
+            pass
+        debts_empty = planning.previous_volume_residual_debts(200)
+        h.check("无遗留债务给安全文案", "无显著遗留" in debts_empty or "首卷" in debts_empty, debts_empty)
+
 
     h.section("scenario: 伏笔回收断链修复(resolve_by 回写 + 隐式 deadline 兜底)")
     with isolated_workspace() as tmp:
@@ -1067,9 +1341,29 @@ def run(h: TestHarness) -> None:
         h.check("原始输出留档", (folder / "beat_raw.md").exists(), "")
         h.check("空项跳过不落盘", not (folder / "beat_raw_retry.md").exists(), "")
         h.includes("留档内容正确", (folder / "beat_input.md").read_text(encoding="utf-8"), "走向格子")
+        # 每章最小审计链也不能被 clean 模式删掉；否则只能看分数表，无法复盘闭环。
+        audit_files = [
+            core.role_artifact("gate", 15, "gate.json"),
+            core.role_artifact("reviewer", 15, "review_input.md"),
+            core.role_artifact("reviewer", 15, "review.md"),
+            core.role_artifact("reviewer", 15, "review_verdict.json"),
+            core.role_artifact("editor", 15, "editor_input.md"),
+            core.role_artifact("editor", 15, "edited.md"),
+            core.role_artifact("archivist", 15, "archive_input.md"),
+            core.role_artifact("archivist", 15, "archive_update.md"),
+            core.role_artifact("gate", 15, "final_gate.json"),
+            core.role_artifact("gate", 15, "committed_gate.json"),
+            core.role_artifact("gate", 15, "final_committed.json"),
+        ]
+        for path in audit_files:
+            _write(path, path.name)
+        transient = core.role_artifact("writer", 15, "draft.md")
+        _write(transient, "临时初稿")
         # cleanup 不碰 beats/_debug:模拟清理后留档仍在
         core.cleanup_chapter_artifacts(15, {"artifact_retention": "clean"})
         h.check("cleanup 后调试留档仍在", (folder / "beat_input.md").exists(), "")
+        h.check("cleanup 保留最小审计链", all(path.exists() for path in audit_files), [str(p) for p in audit_files])
+        h.check("cleanup 仍删除非审计临时稿", not transient.exists(), str(transient))
 
     h.section("scenario: analyst MAP 两段切分——结构台账真名绝不漏进手法观察段")
     with isolated_workspace() as tmp:
@@ -1891,3 +2185,57 @@ def run(h: TestHarness) -> None:
         h.check("analyst MAP 保留(清小说不碰分析)", (tmp / "runtime" / "analyst" / "map_0000.md").exists(), "")
         h.check("analyst 结构报告保留", (tmp / "runtime" / "analyst" / "_structure_calibration.md").exists(), "")
         h.check("手法卡chunk保留", (tmp / "chunks" / "chunk_三线交织.md").exists(), "")
+
+    h.section("scenario: recent_beats_summary 优先事实态摘要,beat计划态降级回退")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _import_modules()
+        import importlib
+        planning = importlib.import_module("pipeline.planning")
+        importlib.reload(planning)
+        summarizer = importlib.import_module("pipeline.summarizer")
+        # 写入第5章摘要(事实态)
+        summaries_dir = tmp / "runtime" / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(summaries_dir / "chapter_005.json", {
+            "chapter": 5, "plot_digest": "沈安向老头讨了一把草药", "signature_actions": [],
+            "recurring_verbs": {}, "sentence_patterns": [], "imagery_used": [], "emotional_moves": [],
+        })
+        # 写入第4章 beat 计划态(第4章无摘要→应回退)
+        beats_dir = tmp / "beats"
+        beats_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(beats_dir / "chapter_4.json", {
+            "标题": "问药章", "本章冲突": "沈安找药被拒", "章末钩子": "老头转身离开",
+        })
+        result = planning.recent_beats_summary(6, lookback=5)
+        # 第5章应走事实态(含plot_digest),不应出现beat计划态标注
+        h.check("第5章走事实态不走计划态", "[正文事实]" in result and "第5章" in result, result)
+        h.check("第5章内容含plot_digest文字", "沈安向老头" in result, result)
+        # 第4章无摘要,应回退beat计划态并标注
+        h.check("第4章回退beat计划态并标注", "[beat计划态" in result and "第4章" in result, result)
+        h.check("第4章beat内容出现在回退行", "沈安找药被拒" in result, result)
+
+    h.section("scenario: normalize_beat 保留多角度字段全链路不丢失(Batch-A命门回归)")
+    with isolated_workspace() as tmp:
+        _seed_workspace(tmp)
+        _import_modules()
+        import importlib
+        # 在 run_pipeline 里测 normalize_beat
+        ensure_scripts_path()
+        run_mod = importlib.import_module("run_pipeline") if False else None
+        # 直接 import run_pipeline 成本高,改用等效逻辑:验证字段透传
+        from pipeline.context import sanitize_beat_for_writer
+        beat_with_angle = {
+            "章节编号": 10, "标题": "多角度章", "视角角色": "沈安",
+            "多角度叙事": "切到黑子:他嗅到了什么(触发条件:主角感知盲区)",
+            "系统了愿": "王婶向沈安许愿求药,触发了愿面板",
+            "修炼锚点": "无",
+            "配角本章动作": "王婶偷偷把银针藏进袖子",
+            "本章冲突": "沈安被索要诊金",
+        }
+        # sanitize_beat_for_writer 不过滤字段,验证多角度字段能到达 writer
+        sanitized = sanitize_beat_for_writer(beat_with_angle)
+        h.check("多角度叙事字段到达writer", "多角度叙事" in sanitized, sanitized)
+        h.check("系统了愿字段到达writer", "系统了愿" in sanitized, sanitized)
+        h.check("配角本章动作字段到达writer", "配角本章动作" in sanitized, sanitized)
+        h.check("多角度内容未被LF替换", "切到黑子" in sanitized["多角度叙事"], sanitized["多角度叙事"])

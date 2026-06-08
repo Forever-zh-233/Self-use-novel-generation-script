@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pipeline.core import (
-    BASE_DIR, OUTPUT_DIR, PROMPTS_DIR, RUNTIME_DIR,
+    BASE_DIR, OUTPUT_DIR, PROMPTS_DIR, RUNTIME_DIR, BEATS_DIR, CONFIG_DIR,
     LEDGER_MD_FILE, MASTER_OUTLINE_FILE, VOLUME_PLAN_FILE, VERSION_DIR,
     LONG_FORESHADOWING_FILE, VOLUME_DIGESTS_FILE, CLIMAX_TENSIONS,
     ACTIVE_THREADS_FILE, LEDGER_FILE,
@@ -218,7 +218,7 @@ def build_story_director_input(chapter: int, detected: Dict[str, Any], run_cfg: 
         make_section("卷纲", read_text(VOLUME_PLAN_FILE), "critical", False),
         make_section("当前活跃弧线", json.dumps(load_active_arcs(), ensure_ascii=False, indent=2), "high", True),
         make_section("期待账本", recent_expectation_tail(), "high", True),
-        make_section("结构化当前状态", structured_state_text(), "high", True),
+        make_section("结构化当前状态", structured_state_text(chapter), "high", True),
         make_section("线索与揭示台账", threads_digest_for_director(chapter) or "（暂无线索台账记录）", "high", True),
         make_section("三线节奏配比", strand_digest_for_director(chapter) or "（暂无三线记录）", "high", True),
         make_section("主角境界进度(停滞观察,定性参考)", realm_progress_digest(chapter), "high", True),
@@ -248,8 +248,11 @@ def run_story_director(chapter: int, run_cfg: Dict[str, Any], timeout: int, forc
         or needs_arc_planning(chapter)
     )
     if not should_call_model:
+        # 区间内沿用上次批注:不重盖 chapter——那是「批注的成文章节」,是 provenance。
+        # 旧代码每章把它改成当前章,既让陈年批注伪装成本章新鲜结论(误导 reviewer/writer),
+        # 又让 last_chapter 每章+1,区间触发永远凑不够(只剩 expires_after_chapter 在驱动重跑)。
+        # 保留成文章节,batch 区间与「上次审核(第N章)」回显才正确。
         data = dict(previous)
-        data["chapter"] = chapter
         save_story_director(data)
         return data
     if run_cfg.get("dry_run"):
@@ -469,7 +472,8 @@ def overdue_foreshadowing_digest(chapter: int, long_term_only: bool = False) -> 
         status = item.get("status", "")
         if status in ("已回收", "已结"):
             continue
-        if item.get("resolved_chapter"):
+        # 部分回收有 remaining_promise → 还欠读者承诺,不能因 resolved_chapter 消失于债务视野
+        if item.get("resolved_chapter") and not item.get("remaining_promise"):
             continue
         if long_term_only and fid not in long_ids:
             continue
@@ -525,7 +529,7 @@ def foreshadowing_progress_digest(chapter: int, stale_threshold: int = 8) -> str
     for fid, item in foreshadowing.items():
         if not isinstance(item, dict):
             continue
-        if item.get("status") in ("已回收", "已结") or item.get("resolved_chapter"):
+        if item.get("status") in ("已回收", "已结") or (item.get("resolved_chapter") and not item.get("remaining_promise")):
             continue
         if str(item.get("strength", "")) not in ("大", "中"):
             continue
@@ -611,11 +615,16 @@ def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> N
         make_section("全书骨架(北极星,不可违背)", outline, "critical", False),
         make_section("当前章节号", f"第{chapter}章。请为接下来的卷生成卷纲。", "critical", False),
         make_section("正典账本(角色关系网/资源/约束/实体)", read_text(LEDGER_MD_FILE, "暂无。"), "high", False),
-        make_section("结构化当前状态", structured_state_text(), "high", True),
+        make_section("结构化当前状态", structured_state_text(chapter), "high", True),
         make_section("期待账本(未回收伏笔)", recent_expectation_tail(), "high", True),
         make_section("长线伏笔资产库", read_text(LONG_FORESHADOWING_FILE), "high", True),
         make_section("长线伏笔进度表(本卷该推进哪几条)", long_foreshadowing_progress(chapter), "critical", False),
         make_section("上卷结构化回顾(承上启下的关键依据)", volume_summary(chapter), "high", False),
+        make_section(
+            "⚠ 上一卷遗留债务清单(新卷『起』段必须逐条处置:接手或显式封存,严禁换地图静默丢弃)",
+            previous_volume_residual_debts(chapter),
+            "critical", False,
+        ),
     ]
     growth_file = BASE_DIR / "config" / "growth_arcs.md"
     if growth_file.exists():
@@ -627,6 +636,14 @@ def run_volume_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> N
             "⚠ 长线伏笔过期警告（本卷必须安排回收）",
             overdue_long,
             "critical", False,
+        ))
+    # 结构参考数据（从原文 analyst 校准报告抽取的卷级节奏分布）
+    vol_norms = structure_norms_digest("volume")
+    if vol_norms:
+        sections.append(make_section(
+            "本书结构参考分布(从原文数出,不是KPI——按剧情需要用,不要硬凑数字)",
+            vol_norms,
+            "high", False,
         ))
     input_text = render_sections(sections)
     if run_cfg.get("dry_run"):
@@ -707,14 +724,30 @@ def needs_arc_planning(chapter: int) -> bool:
     """判断是否需要调用弧线规划师:
     - 没有活跃弧线(首次或全部收束)
     - 所有活跃弧线的最后一个节点 <= 当前章+1(即将用完)
-    - 缺主线弧:活跃弧线全是副线,主线断档(否则副线会独撑很多章,主角无大事、全注水)"""
+    - 缺主线弧:活跃弧线全是副线,主线断档
+    - 当前章不在任何弧线的 span 范围内(弧线空窗期)"""
     arcs = load_active_arcs()
     if not arcs:
         return True
+    # 空窗检测:当前章是否落在某条弧线的 span 范围内
+    covered = False
+    for arc in arcs:
+        span = arc.get("span") or []
+        if len(span) >= 2 and span[0] <= chapter <= span[1]:
+            covered = True
+            break
+        # 兼容无 span 的旧弧线:用 nodes 的 chapter 范围近似
+        if not span:
+            nodes = arc.get("nodes") or []
+            if nodes:
+                chs = [int(n.get("chapter", 0) or 0) for n in nodes]
+                if min(chs) <= chapter <= max(chs) + 3:
+                    covered = True
+                    break
+    if not covered:
+        return True
     # 缺主线:有弧线但没有一条主线,且现存主线/副线还没即将用完时也要补
     if not has_active_mainline(arcs):
-        # 只要还有未走完的弧线撑着(不会立刻触发下面的"即将用完"分支),
-        # 缺主线本身就该补一条主线,不能让副线独撑
         for arc in arcs:
             nodes = arc.get("nodes") or []
             if nodes and max(n.get("chapter", 0) for n in nodes) > chapter + 1:
@@ -729,16 +762,29 @@ def needs_arc_planning(chapter: int) -> bool:
 
 
 def recent_beats_summary(chapter: int, lookback: int = 5) -> str:
-    """最近几章的 beat 摘要,给 arc_planner 看"已经发生了什么"。"""
+    """最近几章"已经发生了什么",给 arc_planner 看,用来在事实基础上规划后续弧线。
+
+    真相源优先级:章节摘要(summarizer 从【定稿正文】提取的 plot_digest)是事实态,
+    优先采用;只有摘要缺失时才回退 beat 计划态(钩子可能在正文里被改写/未实现)。
+    这条修复的是一个真 bug:旧版直接拿 beats/chapter_N.json 的「冲突/钩子」当"已发生"喂给
+    arc_planner,会让弧线规划基于 beat 计划态(而非正文事实)继续往上盖楼——计划态的钩子
+    若被正文绕过,后续弧线就建在了不存在的事实上。"""
+    from pipeline.summarizer import load_summary
     lines = []
     for ch in range(max(1, chapter - lookback), chapter):
+        summary = load_summary(ch)
+        digest = (summary or {}).get("plot_digest") if summary else ""
+        if digest:
+            lines.append(f"第{ch}章[正文事实]:{digest}")
+            continue
+        # 回退:无摘要时用 beat 计划态(标注清楚,arc_planner 据此知道这是计划而非已落实)
         beat_path = BASE_DIR / "beats" / f"chapter_{ch}.json"
         if beat_path.exists():
             beat = load_json(beat_path, {})
             title = beat.get("标题", "")
             conflict = beat.get("本章冲突", "")
             hook = beat.get("章末钩子", "")
-            lines.append(f"第{ch}章「{title}」冲突:{conflict} | 钩子:{hook}")
+            lines.append(f"第{ch}章[beat计划态·正文未落盘摘要]「{title}」冲突:{conflict} | 钩子:{hook}")
     return "\n".join(lines) if lines else "无最近 beat 记录"
 
 
@@ -858,6 +904,79 @@ def recent_scene_devices_digest(chapter: int, lookback: int = 10) -> str:
     return "\n".join(lines)
 
 
+# 系统机制反馈的"指纹词":同一类系统判定反复演示而无信息增量 = 结构重复(如两次"怨愿未解")
+_SYSTEM_MECHANIC_FINGERPRINTS = (
+    "了结方式不符", "怨愿未解", "怨念未解", "蛊根犹在", "了愿成功", "了愿失败",
+    "愿债", "无法了愿", "条件不符", "面板", "灰显", "未解锁",
+)
+
+
+def recent_system_mechanic_digest(chapter: int, lookback: int = 6) -> str:
+    """治"同一系统机制演示重复无增量"(如 Ch104/Ch107 两次『捞鞋→了结方式不符』)。
+    场景装置去重数的是动作/物件标签,抓不到"系统反馈结构相同但载体不同"的重复。
+    这里专扫最近章 beat 的『系统了愿』字段,若同一类系统判定词在近几章重复出现,提示本章
+    要么换机制要么给信息增量(揭示新规则/新代价/新限制),别再演一遍同样的系统反馈。"""
+    from collections import Counter
+    hits: Dict[str, List[int]] = {}
+    for ch in range(max(1, chapter - lookback), chapter):
+        beat_path = BASE_DIR / "beats" / f"chapter_{ch}.json"
+        if not beat_path.exists():
+            continue
+        beat = load_json(beat_path, {})
+        sys_text = str(beat.get("系统了愿") or "")
+        if not sys_text or sys_text.strip() in ("无", "无。", ""):
+            continue
+        for fp in _SYSTEM_MECHANIC_FINGERPRINTS:
+            if fp in sys_text:
+                hits.setdefault(fp, []).append(ch)
+    flagged = [(fp, chs) for fp, chs in hits.items() if len(chs) >= 2]
+    if not flagged:
+        return ""
+    lines = ["最近章节系统机制演示重复检测(同一系统判定连演而无信息增量,是『重复解释机制』的水章信号):"]
+    for fp, chs in sorted(flagged, key=lambda x: -len(x[1]))[:5]:
+        ch_str = "、".join(f"第{c}章" for c in chs)
+        lines.append(
+            f"⚠ 「{fp}」已在 {len(chs)} 章演示({ch_str})。本章若再涉及,必须给信息增量"
+            f"(揭示新规则/新代价/新限制/为何这次不同),不要再演一遍同样的系统反馈。"
+        )
+    return "\n".join(lines)
+
+
+def previous_volume_residual_debts(chapter: int) -> str:
+    """给 volume_planner 的「上一卷遗留债务清单」:换卷时易被静默丢弃的未结清债。
+    三类来源:① 当前活跃弧线里收束条件未达成/最后节点 > 当前章的(剧情线没走完);
+    ② active_threads 里仍活跃的剧情线索 T-/悬念;③ 未回收且临期的伏笔。
+    目的:逼新卷"起"段对每条做明确处置(接手或显式封存),而不是换地图重开。
+    时序:本函数在 run_volume_planner 调 planner 之前调用,此时旧卷弧线尚未归档,可直接读。"""
+    lines: List[str] = []
+    # ① 未走完的弧线(剧情线债)
+    for arc in load_active_arcs():
+        nodes = arc.get("nodes") or []
+        last_ch = max((int(n.get("chapter", 0) or 0) for n in nodes), default=0)
+        title = arc.get("title", "?")
+        res = str(arc.get("resolution_condition") or "未明确")
+        if last_ch > chapter:
+            lines.append(f"- [弧线·未走完] {title}:收束条件「{res}」未达成,最后节点在第{last_ch}章(超出本卷)。新卷须接手或显式说明何处续。")
+        else:
+            lines.append(f"- [弧线·名义收束] {title}:收束条件「{res}」——确认真的了结了,还是只是卷末没写?未了的余波要在新卷起段处置。")
+    # ② 仍活跃的剧情线索/悬念
+    threads = load_active_threads()
+    for tid, t in (threads.get("threads") or {}).items():
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("status") or "活跃") in ("已收", "已闭环", "closed"):
+            continue
+        desc = str(t.get("desc") or t.get("description") or "")[:50]
+        last_adv = t.get("last_advanced")
+        stale = f",已{chapter - int(last_adv)}章没推进" if isinstance(last_adv, int) and chapter - last_adv >= 6 else ""
+        lines.append(f"- [线索·活跃] {tid}:{desc}{stale}。新卷处置:接手/显式封存(说明何时再开)。")
+    if not lines:
+        return "（上一卷无显著遗留债务，或为首卷。）"
+    return ("以下是上一卷遗留、换卷时最容易被静默丢弃的债务。新卷『起』段必须对每一条给明确处置"
+            "——本卷接手推进，或显式写明『暂时封存，将于X卷/某地再开』。严禁换个地图就当它们不存在：\n"
+            + "\n".join(lines))
+
+
 def previous_arcs_summary() -> str:
     """上一批弧线的收束摘要:怎么结的、留了什么尾巴。给新弧线承上启下用。"""
     arcs = load_active_arcs()
@@ -911,6 +1030,14 @@ def structure_norms_digest(scope: str = "arc") -> str:
         body = "\n".join(lines)
         return body if len(lines) > 1 else ""
 
+    if scope == "volume":
+        emit_group("卷级节奏(三段弧比例/高潮位置/阶段密度)", "卷级节奏")
+        emit_group("换线触发情境", "换线触发")
+        emit_group("天际线要求(每卷必须有)", "天际线要求")
+        emit_group("呼吸节奏 cadence", "呼吸cadence")
+        body = "\n".join(lines)
+        return body if len(lines) > 1 else ""
+
     # arc 全量
     emit_group("弧长分级(按类型)", "弧长分级章数")
     emit_group("节点间距(随进程)", "节点间距随进程章数")
@@ -939,7 +1066,7 @@ def build_arc_input(chapter: int, run_cfg: Dict[str, Any], timeout: int,
         make_section("期待账本(未回收伏笔)", recent_expectation_tail(), "normal", True),
         make_section("长线伏笔资产库(卷纲交代的长线伏笔全貌,你负责战术落地)", read_text(LONG_FORESHADOWING_FILE), "high", True),
         make_section("长线伏笔进度表(本弧该顺手推进哪几条)", long_foreshadowing_progress(chapter), "high", False),
-        make_section("最近章节 beat 回顾", recent_beats_summary(chapter), "normal", True),
+        make_section("最近章节已发生事实（正文事实优先，beat计划态仅在摘要缺失时回退）", recent_beats_summary(chapter), "normal", True),
     ]
     # 缺主线·补线模式:把仍在进行的副线告诉规划师,要求只补一条互补的主线,别重复副线已在办的事
     if augment_live_arcs:
@@ -1106,9 +1233,18 @@ def _ingest_side_characters(arcs: List[Dict[str, Any]]) -> int:
     - independent_goal → arc_core.want(不覆盖 archivist 已填的)
     - knowledge_boundary → facts 追加(短摘要,防全量泄露)
     - beat_moments 附到 arc_core.beat_moments(beat_planner 消费)
-    不存在的实体自动建最小卡(type=角色)。返回写入条数。"""
+    不存在的实体自动建最小卡(type=角色)。同人双名用 config/character_aliases.json 归一。
+    返回写入条数。"""
     ledger = load_ledger()
     entities = ledger.setdefault("entities", {})
+    # 加载别名表(可选):{"捞女老汉": "捞鞋老头", ...} — 别名→正典名
+    aliases: Dict[str, str] = {}
+    alias_file = CONFIG_DIR / "character_aliases.json"
+    if alias_file.exists():
+        try:
+            aliases = load_json(alias_file, {})
+        except Exception:
+            pass
     changed = 0
     for arc in arcs:
         for sc in arc.get("side_characters") or []:
@@ -1117,6 +1253,7 @@ def _ingest_side_characters(arcs: List[Dict[str, Any]]) -> int:
             name = str(sc.get("name") or "").strip()
             if not name:
                 continue
+            name = aliases.get(name, name)  # 别名→正典名归一
             e = entities.setdefault(name, {
                 "type": "角色", "summary": sc.get("independent_goal", "")[:60],
                 "status": "活跃", "facts": [], "secrets": [], "arc_core": {},
@@ -1152,6 +1289,122 @@ def _ingest_side_characters(arcs: List[Dict[str, Any]]) -> int:
     return changed
 
 
+# 认知化动词:gist 只含这些"主角在脑内活动"的词、没有外部不可逆变化 = 认知流水章
+_COGNITION_VERBS = (
+    "发现", "感知", "确认", "怀疑", "想起", "意识到", "觉得", "察觉", "记下",
+    "留心", "注意到", "明白", "看出", "听出", "猜", "琢磨", "回忆", "感到", "感受到",
+)
+# 外部不可逆变化的信号词:有人主动做成/做砸、生死离别、关系/退路/债的变更
+_EVENT_SIGNALS = (
+    "决定", "动手", "出手", "拒绝", "答应", "逼", "夺", "杀", "死", "走了", "离开",
+    "撞破", "揭穿", "摊牌", "翻脸", "结盟", "背叛", "交出", "抢", "毁", "断", "立誓",
+    "许诺", "欠下", "签", "送走", "救下", "放走", "暴露", "撕破", "封死", "公开",
+)
+
+
+def arc_structural_warnings(arcs: List[Dict[str, Any]]) -> List[str]:
+    """弧线结构体检(只查客观断链,不判创作好坏)。覆盖三类治本病:
+    ① 主角无主动欲望(protagonist_want/want_drives_decision 缺失)= 游览日志;
+    ② chapter_drift 认知化(连续>3章 gist 全是认知动词、无外部事件)= 原地打转;
+    ③ 节点段缺不可逆变化(整段 drift 没有一格命中事件信号)。
+    返回告警列表,空=体检通过。规划期产出,不停机。"""
+    warns: List[str] = []
+    for arc in arcs:
+        aid = arc.get("arc_id", "?")
+        if not str(arc.get("protagonist_want") or "").strip():
+            warns.append(f"[{aid}] 缺 protagonist_want——主角在本弧没有主动想要的东西,会写成被动游览日志。")
+        if not str(arc.get("want_drives_decision") or "").strip():
+            warns.append(f"[{aid}] 缺 want_drives_decision——没有由欲望逼出的主动决策。")
+        for node in arc.get("nodes") or []:
+            drift = [d for d in (node.get("chapter_drift") or []) if isinstance(d, dict)]
+            if not drift:
+                continue
+            gists = [str(d.get("gist") or "") for d in drift]
+            # ③ 整段没有任何外部事件信号
+            seg_has_event = any(any(s in g for s in _EVENT_SIGNALS) for g in gists)
+            if len(drift) >= 2 and not seg_has_event:
+                nch = node.get("chapter", "?")
+                warns.append(
+                    f"[{aid}] 节点第{nch}章起的 chapter_drift 整段{len(drift)}格无任何外部不可逆事件"
+                    f"(全是铺垫/认知)——这段会读成原地打转,补一个'谁主动做成/做砸一件事'的格子。"
+                )
+            # ② 连续>3章纯认知
+            run_cog = 0
+            for g in gists:
+                is_cog = any(v in g for v in _COGNITION_VERBS) and not any(s in g for s in _EVENT_SIGNALS)
+                run_cog = run_cog + 1 if is_cog else 0
+                if run_cog > 3:
+                    nch = node.get("chapter", "?")
+                    warns.append(
+                        f"[{aid}] 节点第{nch}章段内连续>3章 gist 是纯认知动词(发现/确认/感知…)"
+                        f"——卷纲事件被熬成了主角的理解过程,认知化重写。"
+                    )
+    return warns
+
+
+def arc_output_audit(arcs: List[Dict[str, Any]]) -> tuple:
+    """弧线必填结构化产出体检——对治 mimo 选择性偷懒:prompt 要求"主动产出"的
+    结构化字段(POV自查、章内多角度)最常被跳过(实测活跃弧 pov_decision 未填、
+    in_chapter_angles 全0条)。只查客观缺失,不判断切得好不好。
+    ① pov_decision 缺失且全弧无 POV 节点(prompt 第20条:不安排POV也必须写明 pov_decision 理由,二选一);
+    ② 声明了同场配角(side_characters 非空)却全弧 in_chapter_angles 一条都没有
+       (prompt 第21条:主角是盲人,有同场配角就该借眼补视觉盲区)。
+    返回 (warns, missing):warns 给人看(落盘/打印),missing 是缺项标签集合,供重试点名补哪几项。不停机。"""
+    warns: List[str] = []
+    missing: set = set()
+    for arc in arcs:
+        if not isinstance(arc, dict):
+            continue
+        aid = arc.get("arc_id", "?")
+        nodes = [n for n in (arc.get("nodes") or []) if isinstance(n, dict)]
+        # ① POV 自查产出:既无 POV 节点又无 pov_decision = 自查被整段跳过
+        has_pov_node = any((n.get("narrative_ops") or {}).get("pov") for n in nodes)
+        has_pov_decision = bool(str(arc.get("pov_decision") or "").strip())
+        if not has_pov_node and not has_pov_decision:
+            warns.append(
+                f"[{aid}] 既无任何 POV 节点,又缺 pov_decision——prompt 要求'不安排POV必须写明 "
+                f"pov_decision 理由',这条自查被跳过了(POV产出缺失)。")
+            missing.add("pov_decision")
+        # ② 章内多角度产出:声明了同场配角却 0 条切片
+        side_chars = [s for s in (arc.get("side_characters") or [])
+                      if isinstance(s, dict) and str(s.get("name") or "").strip()]
+        total_angles = sum(len((n.get("narrative_ops") or {}).get("in_chapter_angles") or [])
+                           for n in nodes)
+        if side_chars and total_angles == 0:
+            names = "、".join(str(s.get("name") or "").strip() for s in side_chars[:3])
+            warns.append(
+                f"[{aid}] 声明了配角({names}…)却全弧 0 条 in_chapter_angles——主角是盲人,"
+                f"有同场配角就该借眼补视觉盲区(prompt 第21条),章内多角度产出缺失。")
+            missing.add("in_chapter_angles")
+    return warns, missing
+
+
+def _arc_audit_retry_note(missing: set) -> str:
+    """生成点名缺项的强化重调指令。原则:只补缺项,不推翻上一版其余判断(防重试把好的部分写崩)。"""
+    parts = ["【上一版产出缺了必填项,本次重做务必补齐——只补下面点名的项,其余沿用你上一版的判断,别推翻重写】:"]
+    if "pov_decision" in missing:
+        parts.append(
+            "- POV 自查未产出:本弧若确实不需要任何配角 POV 章,必须在弧线 JSON 末尾加 "
+            '`"pov_decision": "本弧不需要POV,理由:___"`;若需要,就在某节点 narrative_ops.pov 填角色+purpose。二选一,不能两个都空。')
+    if "in_chapter_angles" in missing:
+        parts.append(
+            "- 章内多角度未产出:你声明了同场配角,主角却是盲人——至少给 1 条 narrative_ops.in_chapter_angles"
+            "(借配角的眼睛补一个主角看不见的视觉/动作/反差/情绪),除非本弧主角全程独行(那就把 side_characters 也清空保持一致)。")
+    return "\n".join(parts)
+
+
+def _parse_arc_result(result: str) -> Optional[List[Dict[str, Any]]]:
+    """把 arc_planner 原始输出解析成弧线列表;解析失败返回 None(供调用方降级放弃)。"""
+    try:
+        arcs = json.loads(result.strip() if result.strip().startswith("[") else
+                          result[result.find("["):result.rfind("]") + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(arcs, list):
+        arcs = [arcs] if isinstance(arcs, dict) else []
+    return arcs
+
+
 def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None:
     """调用弧线规划师,生成新的短线弧骨架。
     补线模式:若当前只有副线(缺主线),把活跃副线告知规划师,要求只补一条主线,
@@ -1176,14 +1429,36 @@ def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None
         timeout,
         10000,  # 放宽:弧线现在带 pacing_shape + approach_to_next + chapter_drift(逐章走向)走向,内容更长;arc_planner 非每章跑,放宽无每章成本
     )
-    try:
-        arcs = json.loads(result.strip() if result.strip().startswith("[") else
-                          result[result.find("["):result.rfind("]") + 1])
-    except (json.JSONDecodeError, ValueError) as exc:
-        cli_print(f"[arc_planner] JSON 解析失败:{exc}。弧线未更新,beat_planner 将无弧线指引。")
+    arcs = _parse_arc_result(result)
+    if arcs is None:
+        cli_print("[arc_planner] JSON 解析失败。弧线未更新,beat_planner 将无弧线指引。")
         return
-    if not isinstance(arcs, list):
-        arcs = [arcs] if isinstance(arcs, dict) else []
+    # 必填结构化产出体检 + 一次性强化重调(对治 mimo 偷掉 POV自查/章内多角度)。
+    # arc_planner 弧线级、非每章跑,max_retries 硬封顶,守通宵不停机铁律。
+    audit_cfg = run_cfg.get("arc_output_audit") or {}
+    if audit_cfg.get("enabled", True):
+        max_retries = max(0, int(audit_cfg.get("max_retries", 1)))
+        retried = 0
+        while retried < max_retries:
+            _, missing = arc_output_audit(arcs)
+            if not missing:
+                break
+            retried += 1
+            cli_print(f"[arc_planner] ⚠ 必填产出缺项 {sorted(missing)},强化重调一次({retried}/{max_retries})…")
+            retry_input = arc_input + "\n\n" + _arc_audit_retry_note(missing)
+            retry_result = call_role(
+                "arc_planner", arc_prompt, retry_input,
+                RUNTIME_DIR / "arc_planner_output.md", timeout, 10000,
+            )
+            retry_arcs = _parse_arc_result(retry_result)
+            if retry_arcs is None:
+                cli_print("[arc_planner] 重调输出解析失败,沿用上一版弧线(不停机)。")
+                break
+            arcs = retry_arcs
+        else:
+            _, still = arc_output_audit(arcs)
+            if still:
+                cli_print(f"[arc_planner] ⚠ 重调后仍缺 {sorted(still)},告警放行(不停机,见结构体检报告)。")
     # 补线模式:把新主线和原有副线合并,新 arc_id 不与现有冲突才保留
     if augment:
         existing_ids = {a.get("arc_id") for a in live_arcs}
@@ -1200,8 +1475,31 @@ def run_arc_planner(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> None
     ingested = _ingest_side_characters(arcs)
     if ingested:
         cli_print(f"[arc_planner] 已沉淀 {ingested} 项配角议程/知识边界到 ledger(writer/beat 可读)。")
+    # 结构体检:主角欲望缺失 / 认知化打转 / 段内无不可逆事件 + 必填产出缺项(标记不停机,落盘供复核)
+    struct_warns = arc_structural_warnings(arcs)
+    audit_warns, _ = arc_output_audit(arcs)
+    all_warns = struct_warns + audit_warns
+    if all_warns:
+        report = "# 弧线结构体检告警\n\n" + "\n".join(f"- {w}" for w in all_warns)
+        write_text(RUNTIME_DIR / "arc_structural_warnings.md", report)
+        cli_print(f"[arc_planner] ⚠ 结构体检 {len(all_warns)} 项告警(详见 runtime/arc_structural_warnings.md):")
+        for w in all_warns[:5]:
+            cli_print(f"    {w}")
     arc_names = [a.get("title", "?") for a in (load_active_arcs())]
     cli_print(f"[arc_planner] 当前活跃弧线({len(arc_names)}条):{', '.join(arc_names)}")
+
+
+def designated_angles_for_chapter(chapter: int) -> List[Dict[str, Any]]:
+    """返回 arc_planner 为本章下发的章内多角度(in_chapter_angles)条目列表。
+    供 beat 吸收校验用:arc 给了配额、beat 就必须落实或显式写明为何不适用,
+    不能静默跳过(这是多角度退化"软请求链"的硬化点之一,只查客观配额、不判断切得好不好)。"""
+    angles: List[Dict[str, Any]] = []
+    for arc in load_active_arcs():
+        for n in (arc.get("nodes") or []):
+            for angle in ((n.get("narrative_ops") or {}).get("in_chapter_angles") or []):
+                if int(angle.get("chapter", 0) or 0) == chapter:
+                    angles.append(angle)
+    return angles
 
 
 def active_arcs_for_beat(chapter: int) -> str:
@@ -1230,6 +1528,9 @@ def active_arcs_for_beat(chapter: int) -> str:
             continue
         lines.append(f"\n### {arc.get('title', '?')}({arc.get('type', '?')}) [{arc.get('arc_id', '')}]")
         lines.append(f"目标:{arc.get('summary', '')}")
+        want = str(arc.get("protagonist_want") or "").strip()
+        if want:
+            lines.append(f"★主角本弧主动想要(本章要让他朝这个目标做主动决策,不是被动反应):{want}")
         shape = arc.get("pacing_shape")
         if shape:
             lines.append(f"整弧呼吸:{shape}")
@@ -1294,6 +1595,16 @@ def active_arcs_for_beat(chapter: int) -> str:
             fops = arc.get("foreshadowing_ops") or []
             if fops and not all_fs:
                 lines.append(f"伏笔操作(本弧线规划的,找合适章节安排):{'; '.join(str(f) for f in fops)}")
+        # in_chapter_angles：从所有节点收集匹配本章的章内多角度提示
+        angles_for_chapter = []
+        for n in (arc.get("nodes") or []):
+            for angle in ((n.get("narrative_ops") or {}).get("in_chapter_angles") or []):
+                if int(angle.get("chapter", 0) or 0) == chapter:
+                    angles_for_chapter.append(angle)
+        if angles_for_chapter:
+            lines.append("\n**章内多角度提示（弧线规划师指定，必须落实到 beat 的「多角度叙事」字段）：**")
+            for a in angles_for_chapter:
+                lines.append(f"  切到「{a.get('character','?')}」：{a.get('what','?')}（触发条件：{a.get('why','?')}）")
     # 高潮硬约束:当本章正处于 tension=高潮/高 的节点当章(±1)时,强制要求标关键章
     for arc in arcs:
         for n in arc.get("nodes") or []:
@@ -1335,6 +1646,56 @@ def _beat_moments_for_chapter(chapter: int) -> str:
     return "\n".join(lines)
 
 
+def _protagonist_abilities_digest(max_items: int = 10) -> str:
+    """主角当前已获能力的有界摘要:从 ledger.inventory.techniques + 主角 entities.skills 取有效条目。
+    让 beat_planner 设计真实冲突时知道"哪些能力已经在手"、从而解释为何现有能力绕不过本章难题。"""
+    ledger = load_ledger()
+    lines: List[str] = []
+    # inventory.techniques: 全主角通用功法/灵觉
+    techs = [t for t in (ledger.get("inventory") or {}).get("techniques") or []
+             if isinstance(t, dict) and t.get("status") != "过时"]
+    for t in techs[:max_items]:
+        lines.append(f"- {t.get('name','')}（{t.get('type','')}）")
+    # 主角实体卡上的 skills
+    protagonist_name = "沈安"
+    protagonist = (ledger.get("entities") or {}).get(protagonist_name) or {}
+    skills = [s for s in (protagonist.get("skills") or [])
+              if isinstance(s, dict) and s.get("status") != "过时"]
+    for s in skills[:max(0, max_items - len(techs))]:
+        lines.append(f"- {s.get('name','')}（{s.get('level','?')}）")
+    return "\n".join(lines) if lines else ""
+
+
+def _system_absence_warning(chapter: int, threshold: int = 6) -> str:
+    """检查最近 threshold 章的 beat 里有没有系统/了愿相关内容。
+    如果连续缺席超过阈值，生成警告让 beat_planner 安排一次小型系统事件。"""
+    keywords = ["系统", "愿录", "面板", "了愿", "真心愿", "奖励", "寿命", "愿债"]
+    last_seen = 0
+    for ch in range(max(1, chapter - threshold - 2), chapter):
+        beat_path = BEATS_DIR / f"chapter_{ch}.json"
+        if not beat_path.exists():
+            continue
+        try:
+            text = beat_path.read_text(encoding="utf-8")
+            if any(k in text for k in keywords):
+                last_seen = ch
+        except Exception:
+            pass
+    gap = chapter - last_seen if last_seen > 0 else chapter - 1
+    if gap < threshold:
+        return ""
+    return (
+        f"了愿系统已连续{gap}章没有任何存在感（上次出现：第{last_seen}章）。\n"
+        f"卷纲明确写了主角到青石镇后'暗中用系统了愿赚钱'——系统是日常谋生工具，不是大事件才出现的boss技。\n"
+        f"本章请安排一次系统相关的小事件（以下任选一种，不要求大场面）：\n"
+        f"- 一次小了愿：帮在场某人解决一个小需求→系统弹面板→微小奖励\n"
+        f"- 系统异常：面板闪了一下/数字有变化/新功能灰显\n"
+        f"- 系统影响决策：主角因为想触发真心愿而做了某个选择\n"
+        f"- 系统代价：愿债数字加深/某次帮忙系统没弹面板引发疑问\n"
+        f"把它融进本章的主线事件里，不要单独开一段'用系统'——像主角呼吸一样自然。"
+    )
+
+
 def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str:
     sections = [
         make_section("目标章节", f"第{chapter}章", "critical", False),
@@ -1373,6 +1734,10 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
     scene_devices = recent_scene_devices_digest(chapter)
     if scene_devices:
         sections.append(make_section("最近场景装置去重(本章别再用同一招推进)", scene_devices, "high", False))
+    # 系统机制演示去重:同一系统判定(如"了结方式不符")连演无增量是"重复解释机制"的水章信号
+    sys_mech = recent_system_mechanic_digest(chapter)
+    if sys_mech:
+        sections.append(make_section("系统机制演示去重(同一系统反馈别再无增量重演)", sys_mech, "high", False))
     # 三线节奏(道途/情义/天地):给规划师看配比+断档,决定本章「推进的线」该走哪条。
     # 关键:信号只给规划层(此处+arc_planner),不给writer——节奏平衡是规划的活,
     # 给writer会导致单章视角硬塞。规划师统筹几十章,会安排到合适章节而非挤进本章。
@@ -1416,6 +1781,23 @@ def build_beat_input(chapter: int, run_cfg: Dict[str, Any], timeout: int) -> str
             "配角议程·本章动作提示(基于弧线规划的 side_characters.beat_moments)",
             beat_moments_hints,
             "high", False,
+        ))
+    # 系统了愿连续缺席兜底：检查最近N章beat里有没有系统相关内容
+    system_gap_warn = _system_absence_warning(chapter)
+    if system_gap_warn:
+        sections.append(make_section(
+            "⚠ 系统了愿断档警告（卷纲要求的核心元素连续缺席）",
+            system_gap_warn,
+            "high", False,
+        ))
+    # 主角已获能力有界摘要:让 beat_planner 设计真实冲突,不用没学过的技能绕过障碍。
+    # 有了这个,beat 里"为何已有能力不能解决本章冲突"才有依据可写,避免假冲突。
+    abilities_text = _protagonist_abilities_digest()
+    if abilities_text:
+        sections.append(make_section(
+            "主角当前已获能力摘要（beat 设计冲突时参考：现有能力为何绕不开本章难题）",
+            abilities_text,
+            "normal", True,
         ))
     return compress_sections_if_needed("beat_planner", chapter, sections, run_cfg, timeout)
 
